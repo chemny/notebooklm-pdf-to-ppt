@@ -1,0 +1,7 @@
+interface:
+  display_name: "NotebookLM PDF To PPT"
+  short_description: "Editable PDF/PPT reconstruction for NotebookLM exports"
+  brand_color: "#2563EB"
+  default_prompt: "Use $notebooklm-pdf-to-ppt to convert this flattened NotebookLM PDF or PPTX export into an editable PowerPoint deck."
+policy:
+  allow_implicit_invocation: true
