@@ -13,12 +13,6 @@ This is a **v0.1.0 preview** skill. It is useful for representative-page testing
 - Agent users who want to trigger a local conversion workflow through chat.
 - Workflow designers who need representative-page diagnostics before processing a full deck.
 
-Not a good fit for:
-
-- Users expecting one-click 100% reconstruction for complex slide decks.
-- Use cases that require every icon, chart, illustration, and shape to become editable.
-- NotebookLM content generation, podcasts, study guides, or quizzes.
-
 ## What It Does
 
 - Renders selected PDF pages into PNG images.
@@ -27,36 +21,6 @@ Not a good fit for:
 - Rebuilds a PowerPoint file with a background image plus editable text boxes.
 - Exports preview PNGs through LibreOffice and `pdftoppm` when available.
 - Writes `layout.json` and `qa_summary.json` so OCR/parsing problems can be diagnosed separately from PPTX rendering problems.
-
-## Workflow
-
-```mermaid
-flowchart TD
-    A["Choose representative PDF pages"] --> B["Render pages to PNG"]
-    B --> C["OCR text, coordinates, font size, and color"]
-    C --> D{"Is OCR / structure trusted?"}
-    D -- "No" --> E["Repair OCR, grouping, or style evidence"]
-    E --> C
-    D -- "Yes" --> F{"Choose background mode"}
-    F --> G["original: debug text placement"]
-    F --> H["local-clean: local text cleanup"]
-    F --> I["model-clean: image-model cleanup"]
-    G --> J["Build editable PPTX"]
-    H --> J
-    I --> J
-    J --> K["Render preview PNGs"]
-    K --> L{"Preview close to source?"}
-    L -- "No" --> M["Diagnose OCR/parsing, background, or PPTX rebuild"]
-    M --> C
-    L -- "Yes" --> N["Expand page set or deliver PPTX"]
-```
-
-## What It Is Not
-
-- It does not generate NotebookLM content, podcasts, study guides, or new course materials.
-- It does not promise full element-level decomposition.
-- It does not turn every icon, chart, image, and diagram into editable PowerPoint objects.
-- It does not replace manual visual review for final courseware delivery.
 
 ## Requirements
 
@@ -166,15 +130,6 @@ output/
 ├── 04_pptx/            # editable_text_overlay.pptx
 └── 05_previews/        # preview PNGs when available
 ```
-
-## Quality Rules
-
-- OCR/parsing owns text content, coordinates, grouping, font size, color, and style evidence.
-- PPTX rebuild owns deterministic unit conversion, font substitution, text-box margins, and line spacing.
-- If OCR is wrong, fix OCR/parsing first. Do not compensate by moving text in the renderer.
-- If layout JSON is correct but the preview is wrong, fix the renderer.
-- Continuous rows in the same visual region, column, card, bubble, or panel may be rebuilt as one editable paragraph while preserving visible line breaks.
-- Tables, list rows, glossary rows, Q/A pairs, separate cards, and titles should not be merged unless structure evidence proves they belong to one editable block.
 
 ## Readiness Check
 

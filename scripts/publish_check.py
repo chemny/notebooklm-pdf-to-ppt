@@ -66,8 +66,6 @@ def main() -> int:
     if "README.md" not in readme_en and "中文" not in readme_en:
         warnings.append("README.en.md does not clearly link back to README.md")
     required_readme_sections = [
-        "## 工作流程",
-        "```mermaid",
         "## 核心工作流",
         "## 命令参考",
         "## 依赖",
@@ -77,8 +75,6 @@ def main() -> int:
         if marker not in readme:
             failures.append(f"README.md missing required release section: {marker}")
     required_readme_en_sections = [
-        "## Workflow",
-        "```mermaid",
         "## Core Workflows",
         "## Command Reference",
         "## Requirements",
