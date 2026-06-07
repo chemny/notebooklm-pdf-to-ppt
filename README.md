@@ -38,6 +38,29 @@
 
 如果 OCR 错了，就修 OCR/解析；如果 layout JSON 对但预览错了，就修 PPTX 重建。不要让渲染层通过随意移动、缩放、改字来掩盖 OCR 问题。
 
+## 工作流程
+
+```mermaid
+flowchart TD
+    A["选择代表页 PDF"] --> B["渲染页面为 PNG"]
+    B --> C["OCR 提取文字、坐标、字号、颜色"]
+    C --> D{"OCR / 结构是否可信?"}
+    D -- "否" --> E["修复 OCR、分组或样式证据"]
+    E --> C
+    D -- "是" --> F{"选择背景模式"}
+    F --> G["original: 调试文字位置"]
+    F --> H["local-clean: 本地清理旧文字"]
+    F --> I["model-clean: 图像模型清理复杂背景"]
+    G --> J["生成可编辑 PPTX"]
+    H --> J
+    I --> J
+    J --> K["导出预览 PNG"]
+    K --> L{"预览是否接近原稿?"}
+    L -- "否" --> M["定位问题属于 OCR/解析、背景清理或 PPTX 重建"]
+    M --> C
+    L -- "是" --> N["扩大页数或交付 PPTX"]
+```
+
 ## 安装
 
 克隆仓库后，把仓库文件夹放到你的 agent skills 目录中，确保 `SKILL.md` 位于 skill 根目录。
@@ -47,6 +70,12 @@ git clone https://github.com/<owner>/notebooklm-pdf-to-ppt.git
 ```
 
 如果你的 agent 运行时会缓存 skill 列表，安装后重新打开一个会话。
+
+安装后可以用一句话验证 skill 是否被识别：
+
+```text
+使用 notebooklm-pdf-to-ppt，检查这个 skill 的 readiness，并告诉我还缺哪些依赖。
+```
 
 ## 依赖
 
@@ -92,6 +121,40 @@ output/
 ├── 04_pptx/            # editable_text_overlay.pptx
 └── 05_previews/        # 预览 PNG
 ```
+
+## 核心工作流
+
+### 代表页测试
+
+先选 1-2 页代表页运行，不要一开始处理整套文件。优先覆盖不同页面类型，例如标题页、纯文字页、插画页、表格页或气泡对话页。输出后先看 `05_previews/`，再根据 `02_ocr/qa_summary.json` 判断问题属于 OCR、背景清理还是 PPTX 重建。
+
+### 本地背景清理
+
+当页面是白底、纯色背景或简单卡片时，使用 `--background local-clean`。它速度快、可重复，但复杂插画页可能留下浅色遮挡块。
+
+### 模型背景清理
+
+当旧文字嵌在插画、纹理、气泡或卡片里时，使用 `--background model-clean`。模型只应移除文字像素，保留容器、插画、图标、构图和比例。
+
+### QA 诊断
+
+如果预览和原稿差距明显，先看 `layout.json`：文字、坐标、字号、分组是否正确。layout 错就修 OCR/解析；layout 对但预览错，再修 PPTX 重建。
+
+## 命令参考
+
+| 参数 | 作用 |
+| --- | --- |
+| `--pdf` | 输入 PDF 路径 |
+| `--pages` | 页码范围，例如 `1,2`、`3-5` |
+| `--output-dir` | 输出目录 |
+| `--ocr` | `auto`、`paddle` 或 `tesseract` |
+| `--background` | `original`、`local-clean` 或 `model-clean` |
+| `--model-provider` | 图像模型供应商类型 |
+| `--model-clean-model` | 背景清理模型名称 |
+| `--model-clean-base-url` | 模型 API base URL |
+| `--model-clean-api-key-env` | API key 所在环境变量名 |
+| `--model-clean-fallback` | 模型清理失败后的回退策略 |
+| `--no-preview` | 跳过 LibreOffice 预览导出 |
 
 ## 背景模式
 

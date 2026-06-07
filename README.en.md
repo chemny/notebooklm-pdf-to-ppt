@@ -6,6 +6,19 @@ Convert flattened NotebookLM-style slide PDFs into editable PowerPoint decks. Th
 
 This is a **v0.1.0 preview** skill. It is useful for representative-page testing and workflow iteration, but it is not yet a guaranteed high-fidelity full-deck converter.
 
+## Who Should Use It
+
+- Users who want to turn NotebookLM slide PDF exports into editable PPTX files.
+- Developers studying image-based PDF/PPT reconstruction.
+- Agent users who want to trigger a local conversion workflow through chat.
+- Workflow designers who need representative-page diagnostics before processing a full deck.
+
+Not a good fit for:
+
+- Users expecting one-click 100% reconstruction for complex slide decks.
+- Use cases that require every icon, chart, illustration, and shape to become editable.
+- NotebookLM content generation, podcasts, study guides, or quizzes.
+
 ## What It Does
 
 - Renders selected PDF pages into PNG images.
@@ -14,6 +27,29 @@ This is a **v0.1.0 preview** skill. It is useful for representative-page testing
 - Rebuilds a PowerPoint file with a background image plus editable text boxes.
 - Exports preview PNGs through LibreOffice and `pdftoppm` when available.
 - Writes `layout.json` and `qa_summary.json` so OCR/parsing problems can be diagnosed separately from PPTX rendering problems.
+
+## Workflow
+
+```mermaid
+flowchart TD
+    A["Choose representative PDF pages"] --> B["Render pages to PNG"]
+    B --> C["OCR text, coordinates, font size, and color"]
+    C --> D{"Is OCR / structure trusted?"}
+    D -- "No" --> E["Repair OCR, grouping, or style evidence"]
+    E --> C
+    D -- "Yes" --> F{"Choose background mode"}
+    F --> G["original: debug text placement"]
+    F --> H["local-clean: local text cleanup"]
+    F --> I["model-clean: image-model cleanup"]
+    G --> J["Build editable PPTX"]
+    H --> J
+    I --> J
+    J --> K["Render preview PNGs"]
+    K --> L{"Preview close to source?"}
+    L -- "No" --> M["Diagnose OCR/parsing, background, or PPTX rebuild"]
+    M --> C
+    L -- "Yes" --> N["Expand page set or deliver PPTX"]
+```
 
 ## What It Is Not
 
@@ -52,6 +88,12 @@ git clone https://github.com/<owner>/notebooklm-pdf-to-ppt.git
 
 Start a fresh agent session after installation if your agent runtime caches the skill list.
 
+Verification prompt:
+
+```text
+Use notebooklm-pdf-to-ppt to check readiness and tell me which dependencies are missing.
+```
+
 ## Quick Start
 
 Run the default representative-page flow:
@@ -64,6 +106,24 @@ PYTHONDONTWRITEBYTECODE=1 python scripts/run_simple.py \
   --ocr auto \
   --background local-clean
 ```
+
+## Core Workflows
+
+### Representative-Page Test
+
+Run one or two representative pages first. Pick pages by visual structure, such as title pages, text pages, illustration pages, tables, or speech-bubble dialogue pages. Inspect `05_previews/` first, then use `02_ocr/qa_summary.json` to decide whether the issue belongs to OCR/parsing, background cleanup, or PPTX rebuild.
+
+### Local Background Cleanup
+
+Use `--background local-clean` for white, flat, or simple card backgrounds. It is fast and deterministic, but it may leave visible fill blocks on illustrated pages.
+
+### Model Background Cleanup
+
+Use `--background model-clean` when old text is embedded in illustrations, textured backgrounds, cards, or speech bubbles. The model should remove only text pixels and preserve containers, icons, illustrations, composition, and aspect ratio.
+
+### QA Diagnosis
+
+When the preview differs from the source, inspect `layout.json` first. If text, coordinates, font size, or grouping are wrong, fix OCR/parsing. If layout JSON is correct but the preview is wrong, fix PPTX rebuild.
 
 For illustrated or textured pages, use model background cleanup:
 
@@ -78,6 +138,22 @@ VISION_API_KEY=<your-key> PYTHONDONTWRITEBYTECODE=1 python scripts/run_simple.py
   --model-clean-model gpt-image-2-all \
   --model-clean-base-url https://api.openai.com
 ```
+
+## Command Reference
+
+| Option | Purpose |
+| --- | --- |
+| `--pdf` | Input PDF path |
+| `--pages` | Page selection, such as `1,2` or `3-5` |
+| `--output-dir` | Output directory |
+| `--ocr` | `auto`, `paddle`, or `tesseract` |
+| `--background` | `original`, `local-clean`, or `model-clean` |
+| `--model-provider` | Image model provider type |
+| `--model-clean-model` | Background cleanup model name |
+| `--model-clean-base-url` | Model API base URL |
+| `--model-clean-api-key-env` | Environment variable that stores the API key |
+| `--model-clean-fallback` | Fallback behavior when model cleanup fails |
+| `--no-preview` | Skip LibreOffice preview export |
 
 ## Output Structure
 
