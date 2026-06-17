@@ -24,6 +24,11 @@ from typing import Any
 from PIL import Image
 from paddleocr import PaddleOCR  # type: ignore
 
+# Shared skill-side style probe (color/glyph recovery). Ensure the script's own
+# directory is importable when this worker is launched as a standalone process.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from style_probe import analyze_text_region  # noqa: E402
+
 
 DEFAULT_CJK_FONT = "Noto Sans SC"
 DEFAULT_LATIN_FONT = "Inter"
@@ -47,24 +52,20 @@ def clean_text(text: str) -> str:
 def useful_text(text: str, conf: float, width: float, height: float) -> bool:
     if not text:
         return False
+    if width < 12 or height < 8:
+        return False
     visible = re.findall(r"[A-Za-z0-9\u3400-\u9fff]", text)
     if len(visible) < 2:
-        return False
-    if width < 12 or height < 8:
+        # The old <2 rule silently dropped meaningful short tokens such as
+        # section numerals ("\u56db"/"3") that belong to a heading. Keep a single
+        # high-confidence CJK/digit token; still drop low-confidence noise like
+        # a misread phonetic "/+S/".
+        if conf >= 80 and re.search(r"[0-9\u3400-\u9fff]", text.strip()):
+            return True
         return False
     if conf < 25 and len(visible) < 5:
         return False
     return True
-
-
-def text_color_from_region(image: Image.Image, box: tuple[int, int, int, int]) -> str:
-    x1, y1, x2, y2 = box
-    crop = image.crop((x1, y1, x2, y2)).convert("RGB")
-    dark = [p for p in crop.getdata() if sum(p) < 600]
-    if not dark:
-        return "#111111"
-    avg = tuple(int(sum(p[i] for p in dark) / len(dark)) for i in range(3))
-    return f"#{avg[0]:02X}{avg[1]:02X}{avg[2]:02X}"
 
 
 def make_ocr() -> PaddleOCR:
@@ -103,6 +104,12 @@ def ocr_image(ocr: PaddleOCR, item: dict[str, Any]) -> dict[str, Any]:
         if not useful_text(text, conf, x2 - x1, y2 - y1):
             continue
         height = y2 - y1
+        probe = analyze_text_region(image, (x1, y1, x2, y2))
+        # Size from MEASURED ink height, not a flat bbox ratio. Convert the ink
+        # span to an em size: CJK glyphs fill ~0.86em, Latin ascender ink ~0.72em.
+        ink_h = float(probe.get("glyph_height") or 0) or height
+        em_ratio = 0.86 if contains_cjk(text) else 0.72
+        font_px = round(max(ink_h / em_ratio, 6.0), 2)
         lines.append(
             {
                 "text": text,
@@ -111,9 +118,11 @@ def ocr_image(ocr: PaddleOCR, item: dict[str, Any]) -> dict[str, Any]:
                 "y": y1,
                 "width": x2 - x1,
                 "height": height,
-                "font_size_px": round(height * 0.84, 2),
+                "font_size_px": font_px,
+                "glyph_ink_height": round(ink_h, 2),
                 "font_family": font_for_text(text),
-                "color": text_color_from_region(image, (x1, y1, x2, y2)),
+                "color": probe["color"],
+                "is_light_on_dark": bool(probe.get("is_light_on_dark")),
                 "source": "paddle",
                 "word_boxes": [
                     {

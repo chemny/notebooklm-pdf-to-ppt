@@ -240,10 +240,12 @@ def calibrate_font_size(item: dict[str, Any]) -> None:
     current = float(item.get("font_size_px") or height)
     role = str(item.get("role") or "body")
     if source == "paddle":
-        factor = 0.50 if role == "title" else 0.54
-        item["font_size_px"] = round(min(current, height * factor), 2)
+        # The paddle worker now sizes from MEASURED ink height (style_probe),
+        # so trust it and only clamp pathological extremes. The old 0.50/0.54
+        # bbox factors halved every glyph and were the main "字号偏小" cause.
+        item["font_size_px"] = round(max(6.0, min(current, height * 1.6)), 2)
     elif source == "tesseract":
-        factor = 0.60 if role == "title" else 0.64
+        factor = 0.78 if role == "title" else 0.82
         item["font_size_px"] = round(min(current, height * factor), 2)
 
 
@@ -274,6 +276,58 @@ def normalize_ocr_slide(page: dict[str, Any]) -> dict[str, Any]:
     return page
 
 
+_SECTION_NUMERAL_RE = re.compile(r"^[一二三四五六七八九十百0-9]{1,3}[、.，]?$")
+
+
+def merge_section_numeral_prefix(page: dict[str, Any]) -> None:
+    """Re-attach a lone section numeral ("四") to its heading -> "四、标题".
+
+    PaddleOCR detects the numeral as its own box and often drops the "、". The
+    numeral carries section meaning, so prepend it (with a restored "、") to the
+    nearest same-row heading to its right instead of leaving it floating.
+    """
+    texts = page.get("texts", [])
+    numerals = [
+        item for item in texts
+        if _SECTION_NUMERAL_RE.match(str(item.get("text") or "").strip())
+        and not contains_cjk(re.sub(r"[一二三四五六七八九十百]", "", str(item.get("text") or "")))
+    ]
+    for num in numerals:
+        ny = float(num.get("y") or 0)
+        nh = float(num.get("height") or 0)
+        nx2 = float(num.get("x") or 0) + float(num.get("width") or 0)
+        target = None
+        best_dx = 10**9
+        for item in texts:
+            if item is num:
+                continue
+            iy = float(item.get("y") or 0)
+            ih = float(item.get("height") or 0)
+            # same row: vertical centers overlap
+            if abs((iy + ih / 2) - (ny + nh / 2)) > max(nh, ih) * 0.6:
+                continue
+            ix = float(item.get("x") or 0)
+            dx = ix - nx2
+            if dx < -nh or dx > max(nh, ih) * 4:  # must sit just to the right
+                continue
+            if dx < best_dx:
+                best_dx = dx
+                target = item
+        if target is None:
+            continue
+        digits = re.sub(r"[、.，]", "", str(num.get("text") or "").strip())
+        target_text = str(target.get("text") or "").strip()
+        old_x = float(target.get("x") or 0)
+        old_right = old_x + float(target.get("width") or 0)
+        new_x = min(old_x, float(num.get("x") or 0))
+        target["text"] = f"{digits}、{target_text}"
+        target["x"] = round(new_x, 2)
+        target["width"] = round(old_right - new_x, 2)
+        target["sectionNumeralRestored"] = digits
+    if numerals:
+        page["texts"] = [item for item in texts if item not in numerals]
+
+
 def merge_primary_top_band_heading(page: dict[str, Any]) -> None:
     page_h = int(page.get("height") or 0)
     if not page_h:
@@ -291,7 +345,46 @@ def merge_primary_top_band_heading(page: dict[str, Any]) -> None:
     if any(str(item.get("source") or "") == "tesseract_top_band" for item in top_items):
         return
 
-    ordered = sorted(top_items, key=lambda item: float(item.get("x") or 0))
+    # Merge a heading's OWN fragments only. Anchor on the fragment that carries
+    # the heading signal (a section numeral "X、", else "Key"), then extend to
+    # neighbours that are both horizontally contiguous (small gap) AND similar
+    # in height. This excludes decorative signs / vocab cards that happen to sit
+    # in the top band (e.g. a "TINY SIPS" shop sign left of the title). A numeral
+    # marks the heading START, so a numeral anchor never absorbs anything to its
+    # left.
+    page_w = int(page.get("width") or 0)
+    gap_limit = max(140.0, page_w * 0.12)
+    ordered_all = sorted(top_items, key=lambda item: float(item.get("x") or 0))
+    numeral_re = re.compile(r"[一二三四五六七八九十]+、")
+    anchor_idx = next((i for i, it in enumerate(ordered_all) if numeral_re.search(str(it.get("text") or ""))), None)
+    anchor_is_numeral = anchor_idx is not None
+    if anchor_idx is None:
+        anchor_idx = next((i for i, it in enumerate(ordered_all) if "Key" in str(it.get("text") or "")), None)
+    if anchor_idx is None:
+        return
+    anchor_h = float(ordered_all[anchor_idx].get("height") or 0)
+
+    def _compatible(a: dict[str, Any], b: dict[str, Any]) -> bool:
+        a_right = float(a.get("x") or 0) + float(a.get("width") or 0)
+        if float(b.get("x") or 0) - a_right > gap_limit:
+            return False
+        bh = float(b.get("height") or 0)
+        if anchor_h and bh and abs(bh - anchor_h) > max(40.0, anchor_h * 0.5):
+            return False
+        return True
+
+    ordered = [ordered_all[anchor_idx]]
+    j = anchor_idx
+    while j + 1 < len(ordered_all) and _compatible(ordered_all[j], ordered_all[j + 1]):
+        ordered.append(ordered_all[j + 1])
+        j += 1
+    if not anchor_is_numeral:
+        k = anchor_idx
+        while k - 1 >= 0 and _compatible(ordered_all[k - 1], ordered_all[k]):
+            ordered.insert(0, ordered_all[k - 1])
+            k -= 1
+    if len(ordered) < 2:
+        return
     x1 = min(float(item.get("x") or 0) for item in ordered)
     y1 = min(float(item.get("y") or 0) for item in ordered)
     x2 = max(float(item.get("x") or 0) + float(item.get("width") or 0) for item in ordered)
@@ -313,7 +406,7 @@ def merge_primary_top_band_heading(page: dict[str, Any]) -> None:
     )
     apply_font_policy(merged, int(page.get("width") or 0), page_h)
     calibrate_font_size(merged)
-    page["texts"] = sorted([item for item in page.get("texts", []) if item not in top_items] + [merged], key=lambda item: (float(item.get("y") or 0), float(item.get("x") or 0)))
+    page["texts"] = sorted([item for item in page.get("texts", []) if item not in ordered] + [merged], key=lambda item: (float(item.get("y") or 0), float(item.get("x") or 0)))
     page.setdefault("layout_repairs", []).append(
         {
             "type": "top_band_primary_heading_merge",
@@ -335,6 +428,10 @@ def paragraph_merge_candidate(item: dict[str, Any], page_w: int, page_h: int) ->
         return False
     if item.get("styleGroup"):
         return False
+    if item.get("tableRow"):
+        # A glossary/table row (has a same-row partner in another column) must
+        # not be vertically merged with the row above/below it.
+        return False
     if list_like_text(text):
         # Q:/A: prompts can be multi-line paragraphs; glossary/list items should stay separate.
         if not re.match(r"^[QA][：:]\s+", text):
@@ -349,15 +446,16 @@ def paragraph_merge_candidate(item: dict[str, Any], page_w: int, page_h: int) ->
 def same_paragraph_style(a: dict[str, Any], b: dict[str, Any]) -> bool:
     if a.get("font_family") != b.get("font_family"):
         return False
-    a_size = float(a.get("font_size_px") or 0)
-    b_size = float(b.get("font_size_px") or 0)
-    if not a_size or not b_size:
+    # Compare bbox HEIGHT, not the derived font_size_px. Font size is now
+    # estimated from measured ink height, so sibling lines of one sentence can
+    # diverge a lot (ascenders/descenders) even though their boxes are nearly
+    # the same height -- which was wrongly splitting sentences. The bbox height
+    # is the stable signal; the merged paragraph is locked to a group size after.
+    a_h = float(a.get("height") or 0)
+    b_h = float(b.get("height") or 0)
+    if not a_h or not b_h:
         return True
-    # OCR line boxes often fluctuate within one paragraph because punctuation,
-    # short descenders, or partial-row crops change the measured line height.
-    # Paragraph grouping uses a tolerant pre-merge check, then locks the merged
-    # paragraph to a representative group font size.
-    return abs(a_size - b_size) <= max(5.0, min(a_size, b_size) * 0.34)
+    return abs(a_h - b_h) <= max(14.0, min(a_h, b_h) * 0.45)
 
 
 def can_merge_paragraph_line(prev: dict[str, Any], current: dict[str, Any], page_w: int, page_h: int) -> bool:
@@ -408,6 +506,28 @@ def paragraph_line_ref(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _flow_join(parts: list[str]) -> str:
+    """Join sentence fragments into one flowing string instead of hard breaks.
+
+    OCR splits a sentence into visual rows; forcing those rows back with "\n"
+    produces a rigid break that no longer matches the resized text. Joining them
+    (a space at Latin word boundaries, nothing between CJK) lets word_wrap reflow
+    the sentence as one segment.
+    """
+    out = ""
+    for seg in parts:
+        seg = str(seg or "").strip()
+        if not seg:
+            continue
+        if not out:
+            out = seg
+        elif contains_cjk(out[-1]) or contains_cjk(seg[0]):
+            out += seg
+        else:
+            out += " " + seg
+    return out
+
+
 def merge_paragraph_group(lines: list[dict[str, Any]]) -> dict[str, Any]:
     ordered = sorted(lines, key=lambda item: (float(item.get("y") or 0), float(item.get("x") or 0)))
     x1 = min(float(item["x"]) for item in ordered)
@@ -418,7 +538,7 @@ def merge_paragraph_group(lines: list[dict[str, Any]]) -> dict[str, Any]:
     font_sizes = sorted(float(item.get("font_size_px") or 0) for item in ordered if float(item.get("font_size_px") or 0) > 0)
     merged.update(
         {
-            "text": "\n".join(str(item.get("text") or "").strip() for item in ordered if str(item.get("text") or "").strip()),
+            "text": _flow_join([item.get("text") for item in ordered]),
             "x": round(x1, 2),
             "y": round(y1, 2),
             "width": round(x2 - x1, 2),
@@ -427,18 +547,68 @@ def merge_paragraph_group(lines: list[dict[str, Any]]) -> dict[str, Any]:
             "font_size_px": round(font_sizes[len(font_sizes) // 2], 2) if font_sizes else ordered[0].get("font_size_px"),
             "source": "paragraph_group",
             "textSource": "ocr_paragraph_group",
-            "lineBreakSource": "ocr_visible_rows",
+            "lineBreakSource": "reflow_word_wrap",
             "word_wrap": True,
             "paragraphGroup": {
                 "type": "same_container_multiline",
                 "grouping": "column_aware_open_group",
-                "lineBreakSource": "ocr_visible_rows",
+                "lineBreakSource": "reflow_word_wrap",
                 "lineCount": len(ordered),
                 "lines": [paragraph_line_ref(item) for item in ordered],
             },
         }
     )
     return merged
+
+
+def mark_table_rows(page: dict[str, Any]) -> None:
+    """Flag glossary/table rows so they are not vertically paragraph-merged.
+
+    A vocab card lays out "English | 中文" on the SAME row (two columns). Those
+    items have a same-row partner in a different horizontal column. Stacked
+    sentence lines (bubbles/cards) instead share a column at different y, so they
+    are NOT flagged and still merge into flowing paragraphs.
+    """
+    items = [it for it in page.get("texts", []) if str(it.get("text") or "").strip()]
+    page_w = int(page.get("width") or 0)
+    x_tol = max(40.0, page_w * 0.02)
+
+    def visible_len(text: str) -> int:
+        return len(re.findall(r"[A-Za-z0-9㐀-鿿]", text))
+
+    def column_size(x_left: float) -> int:
+        # how many items share this left-edge column (a repeating list column)
+        return sum(1 for it in items if abs(float(it.get("x") or 0) - x_left) <= x_tol)
+
+    for a in items:
+        a_text = str(a.get("text") or "")
+        al = float(a.get("x") or 0)
+        # A glossary entry is SHORT and sits in a column that repeats >=3 times.
+        # The length gate is what separates a vocab column from a speech bubble
+        # whose wrapped sentence lines also share a left edge.
+        if visible_len(a_text) > 10 or column_size(al) < 3:
+            continue
+        a_cjk = contains_cjk(a_text)
+        ah = float(a.get("height") or 0)
+        acy = float(a.get("y") or 0) + ah / 2
+        ar = al + float(a.get("width") or 0)
+        for b in items:
+            if b is a:
+                continue
+            b_text = str(b.get("text") or "")
+            # the row partner must be a SHORT translation in the OTHER script
+            if visible_len(b_text) > 10 or contains_cjk(b_text) == a_cjk:
+                continue
+            bh = float(b.get("height") or 0)
+            bcy = float(b.get("y") or 0) + bh / 2
+            if abs(acy - bcy) > max(8.0, min(ah, bh) * 0.5):
+                continue  # not on the same row
+            bl = float(b.get("x") or 0)
+            br = bl + float(b.get("width") or 0)
+            overlap = max(0.0, min(ar, br) - max(al, bl))
+            if overlap < min(float(a.get("width") or 1.0), float(b.get("width") or 1.0)) * 0.3:
+                a["tableRow"] = True
+                break
 
 
 def merge_paragraph_text_items(page: dict[str, Any]) -> None:
@@ -513,6 +683,13 @@ def render_pdf(pdf: Path, out_dir: Path, dpi: int, pages_arg: str | None) -> lis
     for idx in pages:
         path = out_dir / f"slide_{idx + 1:03d}.png"
         prefix = out_dir / f"slide_{idx + 1:03d}"
+        # Idempotent cache: a rendered page only changes if the source PDF/page
+        # or DPI changes. Skip the (slow) pdftoppm call when the PNG already
+        # exists so re-running layout/text does not re-render every page.
+        if path.exists() and path.stat().st_size > 0:
+            print(f"[info] reuse cached render for page {idx + 1}", file=sys.stderr)
+            rendered.append({"page_number": idx + 1, "image": str(path)})
+            continue
         subprocess.run(
             [
                 "pdftoppm",
@@ -539,42 +716,22 @@ def render_pdf(pdf: Path, out_dir: Path, dpi: int, pages_arg: str | None) -> lis
     return rendered
 
 
-def text_color_from_region(image: Image.Image, box: tuple[int, int, int, int]) -> str:
-    x1, y1, x2, y2 = box
-    crop = image.crop((x1, y1, x2, y2)).convert("RGB")
-    pixels = list(crop.getdata())
-    dark = [p for p in pixels if sum(p) < 600]
-    if not dark:
-        return "#111111"
-    avg = tuple(int(sum(p[i] for p in dark) / len(dark)) for i in range(3))
-    return f"#{avg[0]:02X}{avg[1]:02X}{avg[2]:02X}"
+_THIS_DIR = str(Path(__file__).resolve().parent)
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+from style_probe import analyze_text_region, text_color_from_region  # noqa: E402,F401
 
 
 def style_evidence_from_region(image: Image.Image, box: tuple[int, int, int, int]) -> dict[str, Any]:
-    import numpy as np
-
-    x1, y1, x2, y2 = box
-    crop = image.crop((x1, y1, x2, y2)).convert("RGB")
-    if crop.width <= 0 or crop.height <= 0:
-        return {"inkDensity": 0.0, "tightInkDensity": 0.0}
-    arr = np.asarray(crop, dtype=np.uint8)
-    luminance = arr.mean(axis=2)
-    dark = luminance < 150
-    dark_ratio = float(dark.mean())
-    ys, xs = np.where(dark)
-    tight_density = 0.0
-    tight_width = 0.0
-    tight_height = 0.0
-    if len(xs):
-        tight = dark[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
-        tight_density = float(tight.mean())
-        tight_width = float(xs.max() - xs.min() + 1)
-        tight_height = float(ys.max() - ys.min() + 1)
+    # Polarity-agnostic ink evidence via the shared style probe. The old version
+    # treated `luminance < 150` as ink, which measured the background (not the
+    # text) on light-on-dark regions and corrupted width-fit and bold decisions.
+    probe = analyze_text_region(image, box)
     return {
-        "inkDensity": round(dark_ratio, 5),
-        "tightInkDensity": round(tight_density, 5),
-        "tightInkWidth": round(tight_width, 2),
-        "tightInkHeight": round(tight_height, 2),
+        "inkDensity": round(float(probe.get("ink_density") or 0.0), 5),
+        "tightInkDensity": round(float(probe.get("tight_ink_density") or 0.0), 5),
+        "tightInkWidth": round(float(probe.get("glyph_width") or 0.0), 2),
+        "tightInkHeight": round(float(probe.get("glyph_height") or 0.0), 2),
     }
 
 
@@ -710,6 +867,51 @@ def apply_textbox_metrics(page: dict[str, Any]) -> None:
         item["textboxMetricsSource"] = "role_and_group_typography"
 
 
+def fit_text_size_to_box(page: dict[str, Any]) -> None:
+    """Shrink any text whose wrapped lines would overflow its box.
+
+    OCR boxes are tight to a single ink line, so a font sized purely from glyph
+    height can wrap (narrow box) or exceed the box height, causing the overflow
+    and overlap seen in tight bilingual cards/bubbles. This is a pure safety cap:
+    pick the largest size (<= current) at which the text, wrapped to the box
+    width, still fits the box height. Items that already fit are left untouched.
+    """
+    import math
+
+    for item in page.get("texts", []):
+        text = str(item.get("text") or "")
+        if not text.strip():
+            continue
+        box_w = float(item.get("width") or 0)
+        scale = float(item.get("textBoxHeightScale") or 1.04)
+        box_h = float(item.get("height") or 0) * scale
+        cur = float(item.get("font_size_px") or 0)
+        if box_w <= 0 or box_h <= 0 or cur <= 0:
+            continue
+        family = item.get("font_family") or font_for_text(text)
+        bold = bool(item.get("font_bold"))
+        # px line box per text line ~= em * 1.25 (leading); be slightly safe.
+        line_box = max(1.05, float(item.get("lineSpacing") or 1.0) * 1.22)
+        hard_lines = text.split("\n") or [text]
+        chosen = cur
+        for trial in (cur * s for s in (1.0, 0.94, 0.88, 0.82, 0.76, 0.70, 0.64, 0.58, 0.52, 0.46, 0.40)):
+            total_lines = 0
+            for ln in hard_lines:
+                if not ln.strip():
+                    total_lines += 1
+                    continue
+                metrics = render_font_metrics(ln, family, trial, bold)
+                width = metrics["width"] if metrics else len(ln) * trial * 0.6
+                total_lines += max(1, math.ceil(width / max(1.0, box_w)))
+            if total_lines * trial * line_box <= box_h * 1.02:
+                chosen = trial
+                break
+        if chosen < cur - 0.5:
+            item["font_size_px"] = round(chosen, 2)
+            item["fontSizeSource"] = "fit_to_box_cap"
+            item["fontSizePreCap"] = round(cur, 2)
+
+
 def font_file_for_family(font_family: str, bold: bool) -> str | None:
     files = FONT_FILES.get(font_family) or ()
     if not files:
@@ -786,7 +988,7 @@ def fit_font_for_item(item: dict[str, Any]) -> dict[str, Any] | None:
     for family in font_fit_candidates(item):
         trial_bold_values = (False, True) if can_fit_weight else (original_bold,)
         for trial_bold in trial_bold_values:
-            for scale in (0.88, 0.92, 0.96, 1.0, 1.04, 1.08):
+            for scale in (0.82, 0.88, 0.94, 1.0, 1.06, 1.12, 1.2):
                 trial_size = max(6.0, base_size * scale)
                 metrics = render_font_metrics(fit_text, family, trial_size, trial_bold)
                 if not metrics:
@@ -1193,10 +1395,87 @@ def run_paddle_worker(rendered: list[dict[str, Any]], timeout: int) -> list[dict
     return data.get("slides") or []
 
 
+def remove_notebooklm_watermark(
+    image,
+    x_frac: float = 0.82,
+    y_frac: float = 0.965,
+    diff_thresh: int = 26,
+):
+    """Erase the NotebookLM export watermark in the bottom-right corner.
+
+    PaddleOCR does not pick up the light-grey "NotebookLM" mark, so it is located
+    visually: only the very bottom strip (below y_frac) is searched, which sits
+    BELOW any QR code in that corner, so the QR is never touched. The watermark
+    ink bbox is filled with the locally-sampled background colour so it blends in.
+    """
+    import numpy as np
+    from PIL import Image as _Image
+
+    W, H = image.size
+    rx, ry = int(W * x_frac), int(H * y_frac)
+    if rx >= W - 4 or ry >= H - 4:
+        return image
+    region = np.asarray(image.crop((rx, ry, W, H)).convert("RGB"), dtype=np.int16)
+    rh, rw = region.shape[:2]
+    # background colour = median of the strip's left margin (clean page edge)
+    margin = region[:, : max(3, rw // 8)].reshape(-1, 3)
+    bg = np.median(margin, axis=0)
+    diff = np.abs(region - bg).sum(axis=2)
+    ink = diff > diff_thresh
+    ys, xs = np.where(ink)
+    if ys.size < 8:
+        return image  # no watermark ink found -> leave the page untouched
+    pad = 8
+    bx1, by1 = max(0, int(xs.min()) - pad), max(0, int(ys.min()) - pad)
+    bx2, by2 = min(rw, int(xs.max()) + pad), min(rh, int(ys.max()) + pad)
+    patch = _Image.new("RGB", (bx2 - bx1, by2 - by1), tuple(int(c) for c in bg))
+    image.paste(patch, (rx + bx1, ry + by1))
+    return image
+
+
+def strip_watermark_from_background(page: dict[str, Any]) -> None:
+    """Apply watermark removal to this page's generated background image in place."""
+    from PIL import Image
+
+    bg_path = page.get("clean_background")
+    if not bg_path or not Path(bg_path).exists():
+        return
+    if str(bg_path) == str(page.get("image")):
+        return  # never edit the shared raw render (model-clean -> original fallback)
+    try:
+        img = Image.open(bg_path).convert("RGB")
+        remove_notebooklm_watermark(img)
+        img.save(bg_path)
+        page["watermarkStripped"] = True
+    except OSError:
+        return
+
+
 def clean_background(page: dict[str, Any], out_path: Path, expand_px: int) -> None:
     from PIL import Image, ImageFilter
 
     image = Image.open(page["image"]).convert("RGB")
+    # Final editable text boxes. local-clean must only erase regions that will be
+    # redrawn as editable text; a masked region with NO surviving editable node
+    # (e.g. a big decorative number OCR'd into mask_words but later dropped) would
+    # otherwise be covered AND never re-added -> the element silently disappears.
+    final_boxes = []
+    for t in page.get("texts", []):
+        try:
+            fx, fy = float(t["x"]), float(t["y"])
+            final_boxes.append((fx, fy, fx + float(t["width"]), fy + float(t["height"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    def _has_replacement(bx1: float, by1: float, bx2: float, by2: float) -> bool:
+        area = max(1.0, (bx2 - bx1) * (by2 - by1))
+        for fx1, fy1, fx2, fy2 in final_boxes:
+            ox = max(0.0, min(bx2, fx2) - max(bx1, fx1))
+            oy = max(0.0, min(by2, fy2) - max(by1, fy1))
+            if ox * oy / area >= 0.3:
+                return True
+        return False
+
     for item in page.get("mask_words") or page.get("texts") or []:
         role = str(item.get("role") or "")
         item_expand = max(2, int(expand_px * (0.55 if role == "title" else 1.0)))
@@ -1206,6 +1485,8 @@ def clean_background(page: dict[str, Any], out_path: Path, expand_px: int) -> No
         y2 = min(image.height, int(item["y"] + item["height"]) + item_expand)
         if x2 <= x1 or y2 <= y1:
             continue
+        if not _has_replacement(x1, y1, x2, y2):
+            continue  # nothing will be redrawn here; keep the original pixels
         fill = sample_background_color(image, (x1, y1, x2, y2))
         patch = Image.new("RGB", (x2 - x1, y2 - y1), fill)
         mask = Image.new("L", (x2 - x1, y2 - y1), 255)
@@ -1347,6 +1628,59 @@ def visual_diff_qa(original_image: Path, cleaned_image: Path, page: dict[str, An
     }
 
 
+def text_background_is_uniform(
+    page: dict[str, Any],
+    std_thresh: float = 26.0,
+    bad_frac: float = 0.18,
+    margin: int = 10,
+) -> bool:
+    """Decide if local-clean is safe for this page (vs needing model-clean).
+
+    local-clean covers each text region with sampled neighbouring colour, so it
+    is invisible only when the background AROUND the text is uniform. For every
+    text box we measure the luminance spread of the surrounding margin frame; if
+    enough boxes sit on a textured/illustrated/dark-varied background, the page
+    needs model-clean. White/flat-colour decks come back uniform -> local-clean
+    (fast, no model call). Bias is safe: only flips to model-clean on clear
+    evidence of texture.
+    """
+    import numpy as np
+    from PIL import Image
+
+    try:
+        img = Image.open(page["image"]).convert("RGB")
+    except (KeyError, OSError):
+        return True
+    lum = np.asarray(img, dtype=np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    H, W = lum.shape
+    bad = 0
+    total = 0
+    for it in page.get("texts", []):
+        try:
+            x, y = float(it["x"]), float(it["y"])
+            w, h = float(it["width"]), float(it["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        x1, y1 = max(0, int(x - margin)), max(0, int(y - margin))
+        x2, y2 = min(W, int(x + w + margin)), min(H, int(y + h + margin))
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            continue
+        crop = lum[y1:y2, x1:x2]
+        frame = np.ones(crop.shape, dtype=bool)
+        iy1, iy2 = max(0, int(y) - y1), min(crop.shape[0], int(y + h) - y1)
+        ix1, ix2 = max(0, int(x) - x1), min(crop.shape[1], int(x + w) - x1)
+        frame[iy1:iy2, ix1:ix2] = False  # exclude the glyph box; keep the surround
+        bg = crop[frame]
+        if bg.size < 20:
+            bg = crop.reshape(-1)
+        total += 1
+        if float(bg.std()) > std_thresh:
+            bad += 1
+    if total == 0:
+        return True
+    return (bad / total) < bad_frac
+
+
 def model_clean_background(
     page: dict[str, Any],
     out_dir: Path,
@@ -1360,6 +1694,26 @@ def model_clean_background(
 ) -> None:
     script = Path(__file__).with_name("repair_background_with_image_model.py")
     page_out = out_dir / f"slide_{int(page['page_number']):03d}"
+    # Idempotent cache: if a cleaned background for this page+model already
+    # exists, reuse it and skip the (slow, billed) image-model call. Lets us
+    # re-run layout/text with new code without regenerating backgrounds.
+    for cand in (
+        page_out / f"{model}.clean_background.normalized.png",
+        page_out / f"{model}.clean_background.png",
+    ):
+        if cand.exists():
+            page["clean_background"] = str(cand)
+            page["model_clean_geometry_qa"] = {"status": "reused"}
+            page["model_clean_visual_qa"] = {
+                "status": "reused",
+                "reason": "cached_clean_background",
+            }
+            print(
+                f"[info] reuse cached clean background for page "
+                f"{page['page_number']}: {cand.name}",
+                file=sys.stderr,
+            )
+            return
     page_out.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
@@ -1619,17 +1973,25 @@ def main() -> int:
     parser.add_argument("--psm", type=int, default=11)
     parser.add_argument("--min-conf", type=int, default=35)
     parser.add_argument("--ocr-timeout", type=int, default=300)
-    parser.add_argument("--background", choices=["original", "clean-text", "local-clean", "model-clean"], default="local-clean")
+    parser.add_argument("--background", choices=["original", "clean-text", "local-clean", "model-clean", "auto"], default="auto")
     parser.add_argument("--mask-expand", type=int, default=6)
-    parser.add_argument("--model-provider", choices=["gemini-native", "openai-image"], default="gemini-native")
-    parser.add_argument("--model-clean-model", default="gemini-3.1-flash-image-preview")
+    # Defaults match the verified working setup on this machine (yunwu gpt-image-2
+    # via the OpenAI image-edit endpoint). gpt-image-2-all routes to a generation
+    # endpoint and times out on edits; gemini-native needs a different key.
+    parser.add_argument("--model-provider", choices=["gemini-native", "openai-image"], default="openai-image")
+    parser.add_argument("--model-clean-model", default="gpt-image-2")
     parser.add_argument("--model-clean-base-url", default="https://yunwu.ai")
     parser.add_argument("--model-clean-api-key-env", default="VISION_API_KEY")
     parser.add_argument("--model-clean-timeout", type=int, default=240)
     parser.add_argument("--model-clean-size", default="1536x864")
     parser.add_argument("--model-clean-insecure", action="store_true")
     parser.add_argument("--model-clean-fallback", choices=["fail", "local-clean", "original"], default="local-clean")
-    parser.add_argument("--no-preview", action="store_true")
+    # Inspection previews are off by default (they cost a slow LibreOffice +
+    # pdftoppm pass and do not affect the .pptx output). Opt in with --preview
+    # when you need before/after comparison images. --no-preview kept for
+    # backward compatibility.
+    parser.add_argument("--preview", action="store_true", help="export inspection preview PNGs (off by default)")
+    parser.add_argument("--no-preview", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     pdf = Path(args.pdf).expanduser().resolve()
@@ -1666,20 +2028,33 @@ def main() -> int:
 
     slides = [normalize_ocr_slide(page) for page in slides]
     for page in slides:
+        merge_section_numeral_prefix(page)
         merge_primary_top_band_heading(page)
+        mark_table_rows(page)
         merge_paragraph_text_items(page)
         apply_visual_style_evidence(page)
         apply_group_style_consistency(page)
         apply_group_typography_consistency(page)
         apply_font_fit(page)
         apply_textbox_metrics(page)
+        fit_text_size_to_box(page)
 
     for parsed in slides:
         image_path = Path(parsed["image"])
-        if args.background in {"clean-text", "local-clean"}:
+        mode = args.background
+        if mode == "auto":
+            uniform = text_background_is_uniform(parsed)
+            mode = "local-clean" if uniform else "model-clean"
+            parsed["backgroundAutoChoice"] = mode
+            print(
+                f"[info] auto: page {parsed['page_number']} -> {mode} "
+                f"({'uniform text background' if uniform else 'textured/dark text background'})",
+                file=sys.stderr,
+            )
+        if mode in {"clean-text", "local-clean"}:
             print(f"[info] clean text background for page {parsed['page_number']}", file=sys.stderr)
             clean_background(parsed, clean_dir / image_path.name, args.mask_expand)
-        elif args.background == "model-clean":
+        elif mode == "model-clean":
             print(f"[info] model clean background for page {parsed['page_number']}", file=sys.stderr)
             try:
                 model_clean_background(
@@ -1710,6 +2085,10 @@ def main() -> int:
                 elif args.model_clean_fallback == "original":
                     parsed["clean_background"] = str(image_path)
                     parsed["model_clean_fallback"] = "original"
+        # Strip the NotebookLM export watermark from the generated background so
+        # it blends with the page. Skipped for "original" mode (no clean bg copy).
+        if mode in {"clean-text", "local-clean", "model-clean"}:
+            strip_watermark_from_background(parsed)
 
     layout = {
         "source": str(pdf),
@@ -1731,11 +2110,14 @@ def main() -> int:
     qa_summary = write_qa_summary(layout, qa_path)
 
     pptx_path = pptx_dir / "editable_text_overlay.pptx"
-    background_key = "clean_background" if args.background in {"clean-text", "local-clean", "model-clean"} else "image"
+    background_key = "clean_background" if args.background in {"clean-text", "local-clean", "model-clean", "auto"} else "image"
     print(f"[info] build pptx at {pptx_path}", file=sys.stderr)
     build_pptx(layout, pptx_path, background_key)
-    print("[info] render preview", file=sys.stderr)
-    previews = [] if args.no_preview else render_preview(pptx_path, preview_dir)
+    if args.preview and not args.no_preview:
+        print("[info] render preview", file=sys.stderr)
+        previews = render_preview(pptx_path, preview_dir)
+    else:
+        previews = []
 
     print(
         json.dumps(

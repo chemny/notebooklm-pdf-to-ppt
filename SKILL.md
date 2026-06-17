@@ -37,33 +37,92 @@ Always separate the two failure domains:
 
 Do not let one layer compensate for the other. If OCR is wrong, fix OCR/parsing/fusion. If layout JSON is right but preview is wrong, fix the renderer.
 
+### Core reconstruction principles
+
+OCR returns only text, boxes, and confidence. Everything else — color, font
+size, weight, family, and what counts as a paragraph — is **reconstructed** by
+this skill. Most fidelity bugs come from reconstructing via a fixed assumption
+instead of measuring. Follow these three principles for any new rule:
+
+1. **Reconstruct by measuring, not by assuming — and stay polarity-agnostic.**
+   Recover color and size from the actual pixels of the text region, never from
+   a baked-in assumption like "dark text on a light background" or "font size =
+   bbox height × constant". Light text on a dark background is normal. The shared
+   probe `scripts/style_probe.py` separates foreground from background by
+   luminance distance and is the single source for color, ink height, and ink
+   density; route new style recovery through it rather than re-deriving pixels.
+
+2. **Base decisions on stable geometry, not on derived values.** Bounding-box
+   height and position are stable; a font size estimated from ink varies between
+   sibling lines (ascenders/descenders). Paragraph/grouping decisions must key
+   off bbox geometry, not the estimated font size.
+
+3. **Every recovered size must fit its box; segment by structure.** OCR boxes are
+   tight to one ink line, so any recovered font size must be reconciled with the
+   box (shrink-to-fit) or it overflows and overlaps. A sentence is ONE flowing
+   segment (let word-wrap reflow it; do not freeze OCR's visual row breaks with
+   hard newlines), but a glossary/table row is NOT a paragraph — distinguish a
+   table row (a short, cross-column translation pair on the same y) from stacked
+   sentence lines (same column, different y) and never vertically merge the former.
+
+These reconstructions interact (enlarging size causes overflow; ink-based size
+causes sibling-line divergence), so each new rule needs a safety check and must
+be validated on rendered output, not just on the layout JSON. OCR has a hard
+ceiling (mis-read phonetics, very thin numerals); do not try to fix engine-level
+recognition errors in post-processing — diagnose, state the limit, and stop.
+
 ## Default Workflow
 
 Use `scripts/run_simple.py` as the default entrypoint for normal PDF-to-PPTX conversion tests. It launches `scripts/pdf_to_ppt_simple.py` through a stable wrapper because direct script startup can stall on this local macOS Python environment.
 
-Default command shape:
+Default command shape (use `python3`; `python` may be absent). `--background`
+defaults to **`auto`** (per-page routing, see below), so a bare run already picks
+the right cleanup per page:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python scripts/run_simple.py \
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_simple.py \
   --pdf /path/to/source.pdf \
   --pages 1,2 \
   --output-dir /path/to/output \
   --ocr auto \
-  --background local-clean
+  --background auto
+```
+
+To force one mode for the whole deck, pass `--background local-clean` or
+`--background model-clean`. For model-clean, on this machine the working image
+model is **`gpt-image-2`** via
+the **`openai-image`** provider (the OpenAI image-edit endpoint). Do NOT use
+`gpt-image-2-all` — yunwu routes it to a generation (dall-e-3) endpoint that
+times out on edit calls. Requires `VISION_API_KEY` (set in `~/.zshrc`):
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_simple.py \
+  --pdf /path/to/source.pdf --pages 1,2 --output-dir /path/to/output \
+  --ocr auto --background model-clean \
+  --model-provider openai-image --model-clean-model gpt-image-2 \
+  --model-clean-fallback local-clean
 ```
 
 This default path is intentionally simple:
 
-1. Render selected PDF pages into PNGs.
-2. OCR text lines and coordinates with PaddleOCR worker by default.
-3. Create a local clean background by covering OCR text regions.
-4. Rebuild a PPTX with the clean background and editable text boxes.
-5. Use LibreOffice + `pdftoppm` to generate preview PNGs when available.
+1. Render selected PDF pages into PNGs. **Cached**: existing `slide_NNN.png` is reused.
+2. OCR text lines and coordinates with PaddleOCR worker by default (`.venv-paddleocr`).
+3. Recover style (color/size/weight) per region via `scripts/style_probe.py`, group/segment text, fit each text size to its box, then clean the background. With `--background auto` each page is routed to local-clean or model-clean automatically. **model-clean is cached**: an existing cleaned background for a page+model is reused (no re-billing).
+4. **Always** strip the NotebookLM watermark from the cleaned background (`strip_watermark_from_background`), then rebuild a PPTX with the clean background and editable text boxes.
+5. Previews are **off by default**. Pass `--preview` to render LibreOffice + `pdftoppm` PNGs for before/after comparison; it does not affect the `.pptx`.
 
 Background modes:
 
+- `auto` (**default, recommended**): per-page routing. `text_background_is_uniform`
+  measures the luminance spread of the background AROUND each text box; pages
+  whose text sits on a uniform/light background go to `local-clean` (fast, no
+  model call), pages with textured/dark/illustrated text backgrounds go to
+  `model-clean`. Solves the all-or-nothing trade-off: a mostly-white deck mostly
+  uses local-clean (e.g. a 15-page deck dropped from ~15 min to ~4 min) while
+  still model-cleaning the few hard pages. Bias is safe — when unsure it picks
+  model-clean.
 - `original`: keep the original page image as background and overlay editable text.
-- `local-clean`: fast local background cleanup by covering text regions with sampled neighboring colors. This is stable but can leave visible pale blocks on illustrated pages.
+- `local-clean`: fast local background cleanup by covering text regions with sampled neighboring colors. Stable, no model call. **Safe-cover rule**: it only covers a region that has a surviving editable text replacement (`_has_replacement`); a region OCR'd into the mask but dropped from final `texts` (e.g. a big decorative number) is left in the background so it is never erased-without-replacement. Can still leave faint pale blocks where text sits on a textured/illustrated background.
 - `model-clean`: high-quality background cleanup through an image model. It sends the original page image plus a text-removal prompt listing OCR text. Use it for illustrated/textured pages where local cleanup is visibly insufficient.
 
 Follow `references/editable-ppt-workflow.md` for the broader staged process and `references/editable-ppt-rules.md` for quality rules.
@@ -155,8 +214,9 @@ Core scripts:
 
 - `scripts/check_readiness.py`: read-only local readiness and dependency check.
 - `scripts/run_simple.py`: stable launcher for the simple flow.
-- `scripts/pdf_to_ppt_simple.py`: default simple PDF -> OCR -> clean background -> python-pptx -> preview flow.
-- `scripts/ocr_paddle_worker.py`: PaddleOCR batch worker called by the simple flow.
+- `scripts/pdf_to_ppt_simple.py`: default simple PDF -> OCR -> clean background -> python-pptx -> preview flow. Key post-processing rules live here: `merge_section_numeral_prefix` (re-attach "四" -> "四、标题"), `merge_primary_top_band_heading` (anchor on numeral/Key, gap+height limited), `mark_table_rows` (glossary rows excluded from paragraph merge), `same_paragraph_style` (bbox-height based), `merge_paragraph_group` + `_flow_join` (one flowing sentence, no hard newlines), `calibrate_font_size` (trusts measured ink size), `fit_text_size_to_box` (shrink-to-fit so text never overflows).
+- `scripts/style_probe.py`: **shared** polarity-agnostic style probe (`analyze_text_region`): foreground/background separation -> true text color, ink height, ink width, ink density. Single source for color/size recovery; used by both `ocr_paddle_worker.py` and `pdf_to_ppt_simple.py`. Replaced the old "dark pixels = text" samplers.
+- `scripts/ocr_paddle_worker.py`: PaddleOCR batch worker called by the simple flow. Sizes text from measured ink height (via `style_probe`), not a flat bbox ratio.
 - `scripts/editable_deck.py`: original local OCR + editable PPTX prototype flow. Keep for reference and comparisons.
 - `scripts/editable_ppt_v2.py`: representative-page orchestrator for the v2 reconstruction pipeline.
 - `scripts/page_structure_parse.py`: page type, groups, element bboxes, edit policies, and style evidence.
@@ -213,6 +273,13 @@ If a PPTX preview looks wrong, first inspect the layout JSON. Renderer changes c
 
 ## Boundaries
 
+- **MUST remove the NotebookLM export watermark from every generated background**,
+  no matter how the background was produced (model-clean OR local-clean) — the
+  source is a NotebookLM export and the bottom-right "NotebookLM" mark must never
+  survive into the deck. `strip_watermark_from_background` runs after every
+  background-clean path and fills the mark with the sampled local background so it
+  blends in; it searches only the very bottom strip (below any corner QR code) so
+  QR codes and real content are preserved. Do not bypass or gate this off.
 - Do not promise full element decomposition.
 - Do not run full decks while representative pages still fail.
 - Do not treat a model-generated clean background as valid without visual QA.
