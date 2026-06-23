@@ -1,7 +1,7 @@
 """Shared text-region style probe (skill code, not third-party OCR).
 
-PaddleOCR / Tesseract only return text + box + confidence. They do NOT return
-color, font, or size. The skill recovers those from the original image. The old
+PaddleOCR returns text + box + confidence. It does NOT return color, font, or
+size. The skill recovers those from the original image. The old
 helpers assumed "text is always dark ink on a light background" (they filtered
 `sum(rgb) < 600` or `luminance < 150` as ink), so light text on a dark
 background (e.g. white chalk on a green board) was filtered out and the sampled

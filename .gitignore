@@ -6,8 +6,7 @@ __pycache__/
 .env.*
 !.env.example
 
-.venv/
-.venv-paddleocr/
+.venv*/
 node_modules/
 
 notebooklm-pdf-to-ppt-output/

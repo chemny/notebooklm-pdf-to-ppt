@@ -30,16 +30,15 @@ REQUIRED_FILES = [
     "scripts/run_simple.py",
     "scripts/pdf_to_ppt_simple.py",
     "scripts/ocr_paddle_worker.py",
-    "scripts/editable_deck.py",
-    "scripts/editable_ppt_v2.py",
-    "scripts/page_structure_parse.py",
-    "scripts/fuse_model_ocr_with_boxes.py",
+    "scripts/style_probe.py",
     "scripts/repair_background_with_image_model.py",
-    "scripts/text_position_diagnostics.py",
+    "scripts/check_readiness.py",
+    "scripts/publish_check.py",
+    "scripts/smoke_test.py",
 ]
 PYTHON_MODULES = ["PIL", "pptx", "numpy"]
-OPTIONAL_PYTHON_MODULES = ["fitz", "pytesseract", "paddleocr", "paddle"]
-BINARIES = ["tesseract", "soffice", "pdftoppm", "pdfinfo"]
+OPTIONAL_PYTHON_MODULES = ["fitz", "paddleocr", "paddle"]
+BINARIES = ["soffice", "pdftoppm", "pdfinfo"]
 
 
 def paddle_python_candidates() -> list[tuple[Path, str]]:
@@ -101,7 +100,6 @@ def main() -> int:
         required_files.append({"path": str(path), "exists": path.exists()})
 
     binaries = {
-        "tesseract": command_version("tesseract", ["--version"]),
         "soffice": command_version("soffice", ["--version"]),
         "pdftoppm": command_version("pdftoppm", ["-v"]),
         "pdfinfo": command_version("pdfinfo", ["-v"]),
@@ -149,8 +147,7 @@ def main() -> int:
         "blockers": blockers,
         "notes": [
             "Default simple flow uses run_simple.py -> pdf_to_ppt_simple.py -> ocr_paddle_worker.py.",
-            "PaddleOCR is the preferred OCR path when paddle_runtime exists.",
-            "Tesseract is fallback only; it was slow in representative tests.",
+            "PaddleOCR is the default and only OCR path for the current main flow when paddle_runtime exists.",
             "VISION_API_KEY is required only for model-based parsing or background cleanup.",
             "This check is read-only and does not validate model API credentials.",
         ],

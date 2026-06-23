@@ -27,7 +27,7 @@ TEXT_EXTENSIONS = {
     ".cfg",
     ".ini",
 }
-IGNORE_DIRS = {".git", "__pycache__", ".venv", ".venv-paddleocr", "node_modules"}
+IGNORE_DIRS = {".git", "__pycache__", "node_modules"}
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[A-Za-z0-9._~/-]{16,}"),
@@ -37,7 +37,7 @@ SECRET_PATTERNS = [
 def text_files() -> list[Path]:
     paths: list[Path] = []
     for path in ROOT.rglob("*"):
-        if any(part in IGNORE_DIRS for part in path.parts):
+        if any(part in IGNORE_DIRS or part.startswith(".venv") for part in path.parts):
             continue
         if path.is_file() and path.suffix in TEXT_EXTENSIONS:
             paths.append(path)

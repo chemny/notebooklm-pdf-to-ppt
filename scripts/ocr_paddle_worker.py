@@ -70,8 +70,8 @@ def useful_text(text: str, conf: float, width: float, height: float) -> bool:
 
 def make_ocr() -> PaddleOCR:
     return PaddleOCR(
-        text_detection_model_name="PP-OCRv5_mobile_det",
-        text_recognition_model_name="PP-OCRv5_mobile_rec",
+        text_detection_model_name="PP-OCRv6_small_det",
+        text_recognition_model_name="PP-OCRv6_small_rec",
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,

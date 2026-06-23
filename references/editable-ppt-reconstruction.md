@@ -18,15 +18,14 @@ The first stable target is not perfect full decomposition. The target is:
 
 ## Main Pipeline
 
-1. Export NotebookLM deck with notebooklm-py.
-2. Extract representative slide images from the PPTX or PDF.
-3. Run local OCR to create `layout.raw.json`.
-4. Use a vision model to create an OCR-anchored semantic layout.
-5. Build text masks from OCR word boxes plus model-repaired text boxes.
-6. Create a clean background per page and run OCR residual-text QA.
-7. Repair failed masked regions with the image model when local cleanup leaves old text or visible artifacts.
-8. Rebuild PPTX from the repaired layout JSON with clean backgrounds and selected editable elements.
-9. Render and compare representative pages before full-deck conversion.
+1. Export or provide a flattened NotebookLM deck, PDF, or slide image set.
+2. Render representative pages into PNG images.
+3. Run PaddleOCR through `scripts/ocr_paddle_worker.py`.
+4. Recover text color, ink size, ink width, and density through `scripts/style_probe.py`.
+5. Group and normalize OCR text into editable text blocks in `scripts/pdf_to_ppt_simple.py`.
+6. Create a clean background per page with local cleanup or optional image-model cleanup.
+7. Rebuild PPTX with python-pptx from the layout JSON and clean backgrounds.
+8. Render and compare representative pages before full-deck conversion.
 
 During development, use representative pages such as `1,2,3,5,10`. Do not run full decks until representative pages pass review.
 
@@ -112,34 +111,26 @@ Explicit line breaks in text elements are preserved. Use them when wrapping is s
 
 ## Model Roles
 
-- Codex: orchestrates files, layout repair prompts, deterministic PPTX rebuild, QA, and packaging.
-- Vision model: extracts or repairs text, layout, hierarchy, font size, color, alignment, and obvious image regions.
-- Image model: removes text from backgrounds or repairs local regions when local masking is insufficient.
+- Codex or the calling agent: orchestrates files, conversion commands, QA, and packaging.
+- PaddleOCR: provides text recognition, confidence, and coordinate anchors.
+- Style probe: recovers visual style evidence from the original rendered page.
+- Image model: optionally removes old text from complex backgrounds when local cleanup is insufficient.
 - PPTX renderer: converts layout JSON into editable PowerPoint elements.
 
 Current default model choices:
 
-- Layout reconstruction: start with `gemini-3.5-flash` for representative-page experiments.
-- Low-cost layout baseline: `gemini-2.5-flash`, but do not use it directly for final PPT rebuild when complex pages are involved.
-- Background repair: default to `gemini-3.1-flash-image-preview` through the Gemini native `generateContent` endpoint.
-- Background repair comparison model: `gpt-image-2-all` through OpenAI-compatible `/v1/images/edits` when the provider supports image editing.
+- OCR: `PP-OCRv6_small_det` + `PP-OCRv6_small_rec`.
+- Background repair: `gpt-image-2` through an OpenAI-compatible image-edit endpoint when `--background model-clean` is used.
 
 Current practical reconstruction default:
 
-- Use `semantic_layout_with_model.py` for layout. The model repairs text and grouping, but coordinates stay anchored to OCR boxes.
-- Use `scripts/build_text_masks.py` to create mask images, clean backgrounds, and `background_text_qa.json`.
-- Add raw OCR text/word boxes as `mask_texts` when text removal is needed. These mask hints are for cleanup only and should not become duplicate editable text.
-- Use page-specific clean backgrounds based on the slide classification. Preserve key visuals for image, diagram, chart, and mixed pages even if fewer non-text elements become editable.
-- Treat any residual old text in `background_text_qa.json` as a repair task before final delivery.
-- Build with `text-overlay` and `--background-key clean_background` after the clean background is ready.
+- Use `scripts/run_simple.py` as the user-facing launcher.
+- Use `scripts/pdf_to_ppt_simple.py` as the maintained conversion pipeline.
+- Use `scripts/ocr_paddle_worker.py` for OCR.
+- Use `scripts/style_probe.py` for measured color, ink height, ink width, and density.
+- Use `scripts/repair_background_with_image_model.py` only for optional model-clean backgrounds.
+- Preserve key visuals for image, diagram, chart, and mixed pages even if fewer non-text elements become editable.
 - Split symbols, labels, numbers, or markers into separate editable elements only when it improves editability, alignment, or styling.
-
-Layered reconstruction experiment:
-
-- Use `scripts/layered_layout_with_model.py` when testing higher-fidelity reconstruction with page classification plus `text`, `shape`, and `image` regions.
-- Treat model-proposed `shape` and `image` regions as candidates, not truth. They must pass screenshot QA before replacing the default OCR-anchored text workflow.
-- Image/icon regions need materialization into local crops or a later mask/inpainting step before they can improve final PPTX quality.
-- Use `scripts/materialize_layered_layout.py` for conservative candidate materialization. Visual candidates are off by default; enable `--materialize-visuals` only after representative-page QA proves the extraction is stable.
 
 ## Font Policy
 

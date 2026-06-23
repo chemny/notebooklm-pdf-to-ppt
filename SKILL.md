@@ -1,7 +1,7 @@
 ---
 name: notebooklm-pdf-to-ppt
 description: Convert image-based NotebookLM slide PDFs/PPTX exports into editable PowerPoint decks. Use when the user wants PDF/PPT image slides reconstructed as editable PPTX with clean backgrounds and editable text, separate from NotebookLM content generation.
-version: 0.1.0
+version: 0.1.8
 ---
 
 # NotebookLM PDF To PPT
@@ -21,8 +21,12 @@ This skill is under active development. The default path is now a small, inspect
 
 Known current conclusions:
 
-- PaddleOCR is stronger than the previous OCR for text recognition and many text boxes, but the latest Paddle/style fusion experiment was not visually better because fusion rules broke grouping, titles, and style placement.
-- Use PaddleOCR as the preferred OCR engine when available, with Tesseract as fallback. Do not promote the older Paddle/style fusion experiment to the default main flow until representative pages show clear visual improvement.
+- PaddleOCR is the only OCR engine in the default main flow. Representative tests showed the removed secondary OCR path did not change final text, geometry, or preview output; it only added rejected candidates and maintenance noise.
+- Current default PaddleOCR models are the official PP-OCRv6 small models: `PP-OCRv6_small_det` for text detection and `PP-OCRv6_small_rec` for text recognition. Keep official model names exactly as published by PaddleOCR; do not rename or alias local model identifiers.
+- Do not use a secondary OCR fallback for top-band heading repair in the default flow. Wrong section numerals are worse than missing numerals; handle heading numbering only when PaddleOCR or another reliable evidence source provides it.
+- When OCR splits a short CJK tail onto the next row inside the same visual text container, merge it into one editable text box and preserve the original visible row break. Do not leave the tail as an independent text object, and do not force a single long CJK line that PowerPoint may fail to wrap.
+- Font fitting is conservative for body text: do not enlarge body text during render-fit, do not switch body Latin text to serif fonts just because a width score looks better, and reject low-confidence font-fit candidates instead of committing bad typography to layout JSON.
+- CJK body font-fit must preserve readability. Do not shrink CJK body text below a conservative floor merely to match rendered width; let the final fit-to-box cap handle overflow.
 - PPTXGenJS and LibreOffice rendering differences are secondary. When structure, text, coordinates, or grouping are wrong, the root cause is the layout/fusion layer, not the PPTX renderer.
 - LibreOffice is useful for preview, conversion, and round-trip validation. PPTXGenJS is useful for deterministic PPTX generation from layout JSON.
 
@@ -89,11 +93,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_simple.py \
 ```
 
 To force one mode for the whole deck, pass `--background local-clean` or
-`--background model-clean`. For model-clean, on this machine the working image
-model is **`gpt-image-2`** via
-the **`openai-image`** provider (the OpenAI image-edit endpoint). Do NOT use
-`gpt-image-2-all` — yunwu routes it to a generation (dall-e-3) endpoint that
-times out on edit calls. Requires `VISION_API_KEY` (set in `~/.zshrc`):
+`--background model-clean`. For model-clean, the portable default is
+**`gpt-image-2`** via the **`openai-image`** provider using an image-edit
+endpoint. Requires `VISION_API_KEY`; compatible proxy providers can be selected
+with `VISION_API_BASE_URL` or `--model-clean-base-url`:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_simple.py \
@@ -159,15 +162,20 @@ Practical execution order:
    - Apply renderer-calibrated OCR font-size estimates before PPTX generation.
    - Classify text role (`title`, `body`, `label`) before font and size normalization.
    - Use style-appropriate fonts only from the approved pool or explicit playful classroom fallbacks.
-   - For high-value top-band headings, use a narrow secondary OCR check when the primary OCR misses prefixes, punctuation, or fragments. Record any repair in `ocr_repairs`; do not hide heading repairs in PPTX rendering.
-   - Secondary top-band OCR must pass a strict heading-format gate before it can replace primary OCR. Reject noisy candidates with stray symbols, malformed `Key...` text, or trailing artifacts; record rejected candidates in `ocr_repair_candidates`.
+   - Do not call a secondary OCR engine as a top-band OCR repair in the default flow. In representative tests it added rejected candidates but did not improve final text, geometry, or preview output.
+   - Missing section numerals should not be guessed. Add or repair section numbers only from reliable primary OCR evidence or a future dedicated numbering module.
    - When primary OCR splits a top heading into adjacent fragments, merge those fragments by x-order into one heading before typography and rebuild. Record this deterministic repair in `layout_repairs`.
    - When OCR splits a continuous paragraph into multiple visible rows inside the same visual region, column, card, bubble, or panel, rebuild it as one editable paragraph while preserving the original visible row breaks. Record `paragraphGroup`, `textSource=ocr_paragraph_group`, and `lineBreakSource=ocr_visible_rows`.
+   - When OCR splits a CJK sentence into a normal line plus a very short continuation tail, such as `...什么工` + `作?`, merge them into one editable text box before paragraph grouping. Preserve the visible row break (`lineBreakSource=ocr_visible_rows`) because PowerPoint may not wrap continuous CJK text reliably.
    - Paragraph grouping must be column/region aware, not only global reading-order based. Interleaved text from another column must not prevent same-region continuation lines from being grouped.
    - Do not merge titles, table cells, glossary/list rows, Q/A pairs, or separate cards just because they are visually near each other. Group only rows with compatible font policy, size, alignment, and local geometry.
    - Derive `font_bold` from original-slide visual evidence, such as title role and tight ink-density in the OCR text region. The PPTX renderer must only execute the recorded style fields; it must not invent bold or regular weight during rendering.
    - For repeated same-column lists, glossaries, or table-like rows, normalize sibling font size and font weight from group-level evidence. Record `fontSizeSource`, `fontSizeLocked`, `typographyGroup`, `textBoxHeightScale`, and `lineSpacing` in layout JSON before PPTX rendering.
    - Run font render-fit after typography grouping. Choose `font_family` only from the approved pool by comparing rendered candidate width and ink density against the original OCR region. Record `fontFit`, `fontFamilySource`, and any size compensation in layout JSON.
+   - Body text render-fit is a shrink/validation pass, not a style generator. For non-title text, only shrink or keep the measured size; do not scale up.
+   - CJK body render-fit must use a higher minimum scale than Latin body text. Avoid shrinking continuous Chinese sentences into unreadable small text just to satisfy width fitting.
+   - For Latin body text, prefer the actual default/fallback sans-serif family. Do not switch body text to `Times New Roman`; reserve serif fitting for explicit title or clearly serif source evidence.
+   - If a font-fit candidate still has poor width match or high score after testing, keep the existing font/size and let the later fit-to-box cap handle overflow.
    - Do not aggressively font-fit Chinese or mixed Chinese/Latin glossary/list groups. For these groups, preserve the approved CJK default font and group typography unless repeated evidence proves a better candidate. Font fitting is safer for titles and homogeneous Latin text.
 
 6. **Background cleanup**
@@ -175,7 +183,7 @@ Practical execution order:
    - Default to local clean-text background for a fast first pass.
    - Use `model-clean` when local cleanup leaves visible blocks, damages illustrations, or cannot preserve textured backgrounds.
    - For `model-clean`, prompt the model to edit the original image directly and remove only the OCR-listed text. Do not describe or reinterpret the scene.
-   - For `gpt-image-2-all`, use `/v1/images/edits` with `multipart/form-data`; do not use `/v1/images/generations` for background repair because it can regenerate a different scene.
+   - For OpenAI-compatible image models, use an image-edit endpoint with `multipart/form-data`; do not use text-to-image generation endpoints for background repair because they can regenerate a different scene.
    - If a model-clean background changes composition, size, or text container positions, diagnose it as a background/OCR alignment issue before judging PPTX rendering.
    - If a model-clean background preserves aspect ratio and composition but returns a different pixel size, normalize it back to the original input canvas and record the geometry QA. Do not treat this as a coordinate failure.
    - After model-clean normalization, run visual-diff QA outside OCR text-mask regions. Text regions are expected to change; non-text regions such as containers, icons, illustrations, cards, panels, and composition should remain stable.
@@ -206,7 +214,7 @@ Before a new reconstruction run on a fresh machine or after major script changes
 python scripts/check_readiness.py
 ```
 
-This is a read-only check. It verifies local files, required Python modules, key binaries such as Tesseract and LibreOffice, optional PaddleOCR availability, and model-related environment variables. It does not install dependencies or call external model APIs.
+This is a read-only check. It verifies local files, required Python modules, key binaries such as LibreOffice and Poppler, PaddleOCR runtime availability, and model-related environment variables. It does not install dependencies or call external model APIs.
 
 ## Script Map
 
@@ -214,25 +222,14 @@ Core scripts:
 
 - `scripts/check_readiness.py`: read-only local readiness and dependency check.
 - `scripts/run_simple.py`: stable launcher for the simple flow.
-- `scripts/pdf_to_ppt_simple.py`: default simple PDF -> OCR -> clean background -> python-pptx -> preview flow. Key post-processing rules live here: `merge_section_numeral_prefix` (re-attach "四" -> "四、标题"), `merge_primary_top_band_heading` (anchor on numeral/Key, gap+height limited), `mark_table_rows` (glossary rows excluded from paragraph merge), `same_paragraph_style` (bbox-height based), `merge_paragraph_group` + `_flow_join` (one flowing sentence, no hard newlines), `calibrate_font_size` (trusts measured ink size), `fit_text_size_to_box` (shrink-to-fit so text never overflows).
-- `scripts/style_probe.py`: **shared** polarity-agnostic style probe (`analyze_text_region`): foreground/background separation -> true text color, ink height, ink width, ink density. Single source for color/size recovery; used by both `ocr_paddle_worker.py` and `pdf_to_ppt_simple.py`. Replaced the old "dark pixels = text" samplers.
-- `scripts/ocr_paddle_worker.py`: PaddleOCR batch worker called by the simple flow. Sizes text from measured ink height (via `style_probe`), not a flat bbox ratio.
-- `scripts/editable_deck.py`: original local OCR + editable PPTX prototype flow. Keep for reference and comparisons.
-- `scripts/editable_ppt_v2.py`: representative-page orchestrator for the v2 reconstruction pipeline.
-- `scripts/page_structure_parse.py`: page type, groups, element bboxes, edit policies, and style evidence.
-- `scripts/fuse_model_ocr_with_boxes.py`: OCR/model text-box fusion.
-- `scripts/build_text_masks.py`: text mask generation.
-- `scripts/repair_background_with_image_model.py`: image-model background text removal.
-- `scripts/extract_obvious_icons.py`: extract obvious icons only when reliable.
-- `scripts/text_position_diagnostics.py`: compare OCR, fused layout, and rendered preview positions.
+- `scripts/pdf_to_ppt_simple.py`: default PDF -> render -> PaddleOCR -> clean background -> python-pptx -> optional preview flow. Key post-processing rules live here: paragraph grouping, safe background cleanup, watermark stripping, typography grouping, conservative font fitting, and PPTX rebuild.
+- `scripts/ocr_paddle_worker.py`: PaddleOCR batch worker called by the simple flow. Uses official `PP-OCRv6_small_det` and `PP-OCRv6_small_rec` by default, and sizes text from measured ink height through `style_probe`.
+- `scripts/style_probe.py`: shared polarity-agnostic style probe (`analyze_text_region`): foreground/background separation -> true text color, ink height, ink width, ink density. Single source for color/size recovery; used by both `ocr_paddle_worker.py` and `pdf_to_ppt_simple.py`.
+- `scripts/repair_background_with_image_model.py`: optional image-model background text removal for `--background model-clean`.
+- `scripts/publish_check.py`: local pre-publish validation for README, metadata, required files, and script syntax.
+- `scripts/smoke_test.py`: local smoke test for script syntax and lightweight package checks.
 
-Experimental scripts:
-
-- `scripts/experimental_paddle_style_fusion.py`: PaddleOCR text/bbox plus existing OCR style-probe experiment. This is not a default main flow.
-- `scripts/experimental_layout_to_pptx.mjs`: minimal PPTXGenJS renderer for experimental layouts.
-- `scripts/experimental_layout_to_pptx.py`: minimal python-pptx renderer for experimental layouts.
-- `scripts/experimental_layout_to_pptx_libreoffice.py`: attempted LibreOffice UNO renderer. Use only for investigation; UNO may be unstable in this local environment.
-- `scripts/experimental_layout_to_odp.mjs`: attempted ODP renderer. Use only for investigation; hand-written ODP was not accepted by LibreOffice in the latest test.
+Old prototype, secondary OCR, mask-edit, renderer comparison, and multi-model fusion scripts are intentionally not part of the maintained skill package. Reintroduce any of them only behind a clear main-flow need and a representative visual regression test.
 
 ## Fonts
 
@@ -253,9 +250,11 @@ PaddleOCR may be used as the primary OCR engine for the simple default flow when
 
 Current policy:
 
+- Use PP-OCRv6 small by default: `PP-OCRv6_small_det` + `PP-OCRv6_small_rec`.
+- Keep PaddleOCR official model names exactly as-is in code, docs, logs, and outputs. Do not invent local aliases for model names.
 - Use PaddleOCR to compare and improve text recognition and bbox quality.
 - Call PaddleOCR through `scripts/ocr_paddle_worker.py`, not by importing PaddleOCR inside the main script.
-- Use Tesseract only as a fallback engine when PaddleOCR is unavailable. Tesseract is not the preferred default because it was too slow on representative page tests.
+- If PaddleOCR is unavailable or fails, report the readiness/runtime problem instead of silently falling back to a weaker OCR path.
 - Do not dump every PaddleOCR result into the final PPTX layout.
 - Filter low-confidence fragments, logo text, decorative background text, and short signage.
 - Treat OCR as the source for text and bbox evidence; detailed typography is still estimated unless a separate style probe is explicitly added.

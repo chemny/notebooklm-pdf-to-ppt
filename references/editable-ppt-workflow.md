@@ -4,7 +4,7 @@ This workflow is the standard execution path for converting image-based Notebook
 
 ## Workflow Summary
 
-`Input export -> representative pages -> page-structure parse -> structure gate -> text/style/coordinate extraction -> model text and style evidence repair -> font mapping -> text masks -> image-model background cleanup -> deterministic layout assembly -> PPTX rebuild -> preview QA -> representative repair -> full conversion`
+`Input export -> representative pages -> render images -> PaddleOCR extraction -> style probing -> text grouping/font mapping -> background cleanup -> deterministic PPTX rebuild -> preview QA -> representative repair -> full conversion`
 
 ## Stage 1: Input And Scope
 
@@ -53,50 +53,44 @@ Output:
 
 - `rendered/slide_###.png` or equivalent image files.
 
-## Stage 4: Page Structure Parse
+## Stage 4: OCR And Style Parse
 
 Actions:
 
-- Parse each representative page before selecting the reconstruction strategy.
-- Use the page types from `references/editable-ppt-rules.md`: `cover`, `text`, `card`, `flow`, `diagram`, `table`, `data`, `image`, `mixed`.
-- Extract structure groups such as title regions, cards, flow steps, tables, diagrams, image panels, and grouped callouts.
-- Extract element-level fields: `type`, `role`, `groupId`, `bbox`, `editPolicy`, `backgroundPolicy`, text content, and style evidence.
-- Save the page structure layout as `layout.structure.json`.
+- Run PaddleOCR on selected page images.
+- Extract text, confidence, line boxes, coordinates, and reading-order candidates.
+- Recover visual style evidence from the rendered slide with `style_probe`: color, ink height, ink width, and ink density.
+- Group adjacent rows by local region, baseline, role, and visual container.
+- Save the parsed layout as `layout.json`.
 
 Decision point:
 
-- If page type, groups, bboxes, edit policies, or style evidence are unclear, stop before OCR fusion, mask cleanup, or PPTX rebuild.
+- If text, coordinates, font size, color, or grouping are visibly wrong, stop before background cleanup or PPTX rebuild.
 - If a page is `flow`, `diagram`, `data`, `image`, or `mixed`, preserve key visuals over aggressive decomposition.
 - If a page is mostly `text`, `card`, or `table`, prioritize text editability and background cleanup inside confirmed groups.
 
 Output:
 
-- `layout.structure.json` with page type, groups, elements, and quality scores.
+- `layout.json` with text boxes, coordinates, style estimates, grouping metadata, and QA fields.
 
-## Stage 5: Structure Gate
+## Stage 5: Parse Gate
 
 Actions:
 
-- Validate structure before any expensive downstream reconstruction.
-- Confirm every important text element belongs to a group.
-- Confirm group bboxes and element bboxes are in the original slide coordinate system.
-- Detect common model coordinate-space failures, such as wide slides whose horizontal structure is compressed into a 1024px coordinate range.
-- Confirm page-type expectations:
-  - `card`: card/panel groups are present;
-  - `flow`: step groups and number/label/body relationships are present;
-  - `table`: cells/rows/columns are present;
-  - `diagram`: labels and connectors are separated or intentionally flattened.
-- Confirm each editable text element has style evidence: font category, candidates, weight, color, and confidence.
+- Validate parsed layout before any expensive downstream reconstruction.
+- Confirm important text elements are present and grouped by local visual region.
+- Confirm bboxes are in the original slide pixel coordinate system.
+- Confirm each editable text element has recoverable style evidence: size, color, weight estimate, font policy, and confidence.
+- Confirm decorative text, watermarks, logo text, and background signage are filtered or marked as non-editable.
 
 Decision point:
 
 - If the gate fails, do not run background cleanup, icon extraction, or PPTX rebuild.
-- Repair the parser prompt, switch model, add OCR hints, apply deterministic parse-stage coordinate repair, or manually calibrate the representative page first.
+- Repair OCR normalization, grouping rules, style probing, or page-specific parse handling first.
 
 Output:
 
-- Gate report with `passed`, `issues`, `warnings`, page type, group count, element count, and editable text count.
-- Optional repaired structure JSON when the failure is a deterministic parse-stage issue such as x-axis coordinate scaling.
+- QA fields in `qa_summary.json`, including text counts, repairs, paragraph groups, font-fit counts, and review markers.
 
 ## Stage 5.5: OCR/Parsing Accuracy Gate
 
@@ -130,38 +124,36 @@ Output:
 
 - Style-aware layout JSON whose style decisions can be traced separately from OCR coordinates and font-size measurements.
 
-## Stage 6: OCR Anchor Extraction
+## Stage 6: OCR Anchor Rules
 
 Actions:
 
-- Run OCR on selected page images.
-- Extract text, word boxes, line boxes, confidence, and estimated text color/size when possible.
-- Extract visual style evidence when possible: font category, likely font candidates, weight, color, and style confidence.
-- Save the raw OCR layout.
+- Treat PaddleOCR as the primary text and coordinate source in the maintained main flow.
+- Filter low-confidence fragments, logo text, decorative text, and watermarks before final layout.
+- Merge same-baseline fragments and same-container continuation rows when the grouping evidence is stable.
+- Keep all published coordinates in source image pixels.
 
 Output:
 
-- `layout.raw.json`.
+- OCR-derived text boxes inside `layout.json`.
 
 Notes:
 
-- OCR is not the source of truth for text content.
-- OCR is primarily used for coordinates, masks, and local alignment hints.
-- OCR-derived style data is an anchor, not the final font decision.
+- OCR is the default source for editable text and coordinate anchors.
+- OCR-derived style data is evidence, not the final font decision; final font family and weight still pass through approved font policy and style checks.
 
-## Stage 7: Semantic Layout Repair
+## Stage 7: Optional Semantic Repair
 
 Actions:
 
-- Send page image plus OCR hints to the layout model.
-- Ask the model to repair text content, semantic structure, grouping, element roles, and reading order.
-- Ask the model to output style evidence: `fontCategory`, `fontCandidates`, `fontWeight`, and `styleConfidence`.
-- Do not let the model directly control final coordinates. Font family must be mapped from style evidence to the approved local font pool.
-- Keep model output as semantic and style guidance only. For trusted OCR matches, final text content, coordinates, and font size must come from OCR/visual anchors exactly as recorded in the OCR layout. Model text may be stored as advisory `modelText`, but it must not replace trusted OCR text during fusion or rebuild.
+- Use semantic/model repair only when the maintained OCR-first path cannot parse a representative page well enough.
+- Treat model output as advisory for grouping, missing text candidates, and hierarchy.
+- Do not let model output directly control final coordinates when OCR or visual anchors exist.
+- Font family must be mapped from style evidence to the approved local font pool.
 
 Output:
 
-- `layout.semantic.json` or equivalent repaired layout.
+- Optional advisory metadata such as `modelText` or repair notes; the maintained main flow does not require this file.
 
 Decision point:
 
@@ -191,10 +183,9 @@ Output:
 Actions:
 
 - Create `clean_background` for every page that will receive editable replacement text.
-- Generate text masks from OCR word boxes plus model-repaired text boxes.
-- Treat local mask fill as a QA/debug baseline only. It is not the default final background cleanup path for illustrated, image-heavy, diagram, mixed, or non-flat pages.
+- Use OCR text boxes as cleanup regions. Treat local fill as acceptable for flat/simple pages and as a QA/debug baseline for complex illustrated pages.
 - Use image-model cleanup by default when old text is embedded in visual backgrounds, speech bubbles, photos, diagrams, screenshots, charts, or textured panels.
-- For `gpt-image-2-all` / Image 2 cleanup, use no-mask editing by default: send the original page image plus a prompt that removes text glyphs and preserves non-text containers. Do not send OCR masks to Image 2 unless a verified edit endpoint explicitly supports masks.
+- For OpenAI-compatible image cleanup, use no-mask editing by default: send the original page image plus a prompt that removes text glyphs and preserves non-text containers. Do not send OCR masks unless a verified edit endpoint explicitly supports masks.
 - Keep OCR/model masks as internal artifacts for layout, coverage, residual-text QA, and possible manual debugging.
 - Check the model response usage before accepting a background. If an image-reference/edit request reports `image_tokens = 0`, the model did not consume the source image and the result must be rejected.
 - Prefer mask-assisted image-model repair when the mask is reliable. Use full-background image-model cleanup when the provider does not support masked editing or when masked editing is blocked.

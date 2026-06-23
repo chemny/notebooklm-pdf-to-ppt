@@ -4,7 +4,7 @@
 
 把 NotebookLM、课件工具或其他来源导出的图片型 PDF，重建成带有可编辑文字层的 PowerPoint 文件。
 
-这是一个 **v0.1.0 preview** 版本。它适合做代表页测试、PDF 转可编辑 PPTX 的工作流实验、OCR/背景清理/重建效果诊断；还不应该被包装成成熟的全量高保真转换器。
+这是一个 **v0.1.8 preview** 版本。它适合做代表页测试、PDF 转可编辑 PPTX 的工作流实验、OCR/背景清理/重建效果诊断；还不应该被包装成成熟的全量高保真转换器。
 
 ## 适合谁
 
@@ -15,13 +15,13 @@
 
 ## 核心能力
 
-- 渲染 PDF 指定页面为图片；
-- 用 OCR 提取文字、坐标、字号估计、颜色和分组信息；
-- 清理背景中的旧文字；
-- 用 `python-pptx` 重建可编辑文字层；
-- 用 LibreOffice 和 `pdftoppm` 生成预览图；
-- 输出 `layout.json` 和 `qa_summary.json`，便于区分 OCR/解析问题和 PPTX 渲染问题；
-- 支持代表页优先，而不是一开始就跑完整套文件。
+| 能力 | 帮你完成什么 |
+| --- | --- |
+| 代表页转换 | 先处理少量典型页面，快速判断整套课件是否值得继续转换 |
+| PaddleOCR 文字解析 | 提取文字、坐标、字号估计、颜色和分组信息 |
+| 背景文字清理 | 移除扁平背景里的旧文字，避免和可编辑文字重复 |
+| 可编辑 PPTX 重建 | 用 `python-pptx` 生成带背景图和可编辑文字框的 PowerPoint |
+| 预览与诊断 | 用 LibreOffice / Poppler 生成预览，并输出 `layout.json`、`qa_summary.json` 定位问题归属 |
 
 ## 设计原则
 
@@ -59,14 +59,12 @@ git clone https://github.com/<owner>/notebooklm-pdf-to-ppt.git
 
 推荐安装：
 
-- Tesseract OCR
 - PaddleOCR，并通过 `PADDLEOCR_PYTHON` 指向单独虚拟环境里的 Python
+- 当前默认 PaddleOCR 模型：`PP-OCRv6_small_det` + `PP-OCRv6_small_rec`
 
 可选：
 
 - 图像模型 API，用于 `--background model-clean`
-- PyMuPDF / `fitz`，用于旧版或实验脚本
-- `pptxgenjs`，用于实验 JS 渲染器
 
 ## 快速开始
 
@@ -118,7 +116,7 @@ output/
 | `--pdf` | 输入 PDF 路径 |
 | `--pages` | 页码范围，例如 `1,2`、`3-5` |
 | `--output-dir` | 输出目录 |
-| `--ocr` | `auto`、`paddle` 或 `tesseract` |
+| `--ocr` | `auto` 或 `paddle`；当前主流程只走 PaddleOCR |
 | `--background` | `original`、`local-clean` 或 `model-clean` |
 | `--model-provider` | 图像模型供应商类型 |
 | `--model-clean-model` | 背景清理模型名称 |
@@ -143,7 +141,7 @@ VISION_API_KEY=<your-key> PYTHONDONTWRITEBYTECODE=1 python scripts/run_simple.py
   --ocr auto \
   --background model-clean \
   --model-provider openai-image \
-  --model-clean-model gpt-image-2-all \
+  --model-clean-model gpt-image-2 \
   --model-clean-base-url https://api.openai.com
 ```
 

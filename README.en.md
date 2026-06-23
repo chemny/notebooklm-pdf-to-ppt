@@ -4,7 +4,7 @@
 
 Convert flattened NotebookLM-style slide PDFs into editable PowerPoint decks. This skill focuses on post-export reconstruction: OCR, background text cleanup, editable PPTX rebuild, preview rendering, and quality diagnosis.
 
-This is a **v0.1.0 preview** skill. It is useful for representative-page testing and workflow iteration, but it is not yet a guaranteed high-fidelity full-deck converter.
+This is a **v0.1.8 preview** skill. It is useful for representative-page testing and workflow iteration, but it is not yet a guaranteed high-fidelity full-deck converter.
 
 ## Who Should Use It
 
@@ -13,14 +13,15 @@ This is a **v0.1.0 preview** skill. It is useful for representative-page testing
 - Agent users who want to trigger a local conversion workflow through chat.
 - Workflow designers who need representative-page diagnostics before processing a full deck.
 
-## What It Does
+## Core Capabilities
 
-- Renders selected PDF pages into PNG images.
-- Extracts OCR text, coordinates, estimated font size, color, and grouping metadata.
-- Cleans old text from the background with local fill or an optional image model.
-- Rebuilds a PowerPoint file with a background image plus editable text boxes.
-- Exports preview PNGs through LibreOffice and `pdftoppm` when available.
-- Writes `layout.json` and `qa_summary.json` so OCR/parsing problems can be diagnosed separately from PPTX rendering problems.
+| Capability | What it helps you do |
+| --- | --- |
+| Representative-page conversion | Test a few typical pages before spending time on a full deck |
+| PaddleOCR text parsing | Extract text, coordinates, estimated font size, color, and grouping metadata |
+| Background text cleanup | Remove old flattened text so editable replacement text is not duplicated |
+| Editable PPTX rebuild | Generate a PowerPoint deck with clean backgrounds and editable text boxes |
+| Preview and diagnosis | Render previews and write `layout.json` / `qa_summary.json` to separate OCR issues from rebuild issues |
 
 ## Requirements
 
@@ -33,14 +34,12 @@ Required for the default local flow:
 
 Recommended:
 
-- Tesseract OCR
 - PaddleOCR in a separate virtual environment, configured with `PADDLEOCR_PYTHON`
+- Current default PaddleOCR models: `PP-OCRv6_small_det` + `PP-OCRv6_small_rec`
 
 Optional:
 
 - Image model API credentials for `--background model-clean`
-- `fitz` / PyMuPDF for legacy or experimental scripts
-- `pptxgenjs` for the experimental JS renderer
 
 ## Install
 
@@ -99,7 +98,7 @@ VISION_API_KEY=<your-key> PYTHONDONTWRITEBYTECODE=1 python scripts/run_simple.py
   --ocr auto \
   --background model-clean \
   --model-provider openai-image \
-  --model-clean-model gpt-image-2-all \
+  --model-clean-model gpt-image-2 \
   --model-clean-base-url https://api.openai.com
 ```
 
@@ -110,7 +109,7 @@ VISION_API_KEY=<your-key> PYTHONDONTWRITEBYTECODE=1 python scripts/run_simple.py
 | `--pdf` | Input PDF path |
 | `--pages` | Page selection, such as `1,2` or `3-5` |
 | `--output-dir` | Output directory |
-| `--ocr` | `auto`, `paddle`, or `tesseract` |
+| `--ocr` | `auto` or `paddle`; the current main flow uses PaddleOCR only |
 | `--background` | `original`, `local-clean`, or `model-clean` |
 | `--model-provider` | Image model provider type |
 | `--model-clean-model` | Background cleanup model name |

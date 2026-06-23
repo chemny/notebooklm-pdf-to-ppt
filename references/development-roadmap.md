@@ -12,17 +12,22 @@ The skill converts flattened NotebookLM PDF/PPTX/image exports into editable PPT
 
 ## Current Diagnosis
 
-The latest PaddleOCR + style-probe fusion experiment did not beat the earlier stable output.
+The maintained main flow is now intentionally small:
 
-The failure was mainly in the fusion layer:
+```text
+run_simple.py -> pdf_to_ppt_simple.py -> ocr_paddle_worker.py -> style_probe.py -> background cleanup -> python-pptx rebuild
+```
 
-- title blocks were split or incorrectly reconstructed;
-- decorative/background text leaked into editable PPT objects;
-- PaddleOCR boxes were added too broadly;
-- font size and style were estimated too roughly for unmatched PaddleOCR candidates;
-- the renderer faithfully drew a bad layout.
+PaddleOCR is the only OCR engine in the default path. Older secondary OCR,
+mask-edit, renderer comparison, and multi-model fusion prototypes were removed
+from the release package because they did not improve the final representative
+output and made failures harder to diagnose.
 
-PaddleOCR itself still showed value for text recognition and many text boxes, but it should remain experimental until fusion rules prove stable across representative pages.
+The remaining fidelity limits are concentrated in three places:
+
+- OCR/parser quality: text content, grouping, coordinates, and line boxes.
+- Style recovery: font family, size, weight, color, line spacing, and paragraph grouping.
+- Background cleanup: old-text removal without damaging non-text visuals.
 
 ## Main Flow Stability Rule
 
@@ -79,18 +84,16 @@ Group by visual containers and semantic role before matching text:
 
 Do not allow independent line matching to break a title or body paragraph into random pieces.
 
-### 3. Keep PaddleOCR As A Candidate Source
+### 3. Keep PaddleOCR Output Filtered And Structured
 
-Use PaddleOCR for comparison and repair candidates, not as the default dump source.
+Use PaddleOCR as the primary OCR source, but do not dump every raw OCR fragment
+into the final layout. Promotion rules must include:
 
-Candidate promotion rules must include:
-
-- high confidence;
-- region allowed by page structure;
-- not a logo/decorative zone;
-- not a short background sign unless explicitly editable;
-- consistent with nearby group role;
-- no conflict with a higher-confidence existing text group.
+- high enough confidence for the role;
+- not a logo, watermark, decorative zone, or short background sign unless explicitly editable;
+- consistent with nearby group role and visual container;
+- mergeable with adjacent same-baseline or same-container text when appropriate;
+- no conflict with an existing higher-confidence text group.
 
 ### 4. Improve Style Evidence Separately
 
@@ -100,7 +103,8 @@ Do not infer style from PaddleOCR alone. PaddleOCR does not provide full typogra
 
 ### 5. Renderer Choice
 
-Use PPTXGenJS for fast deterministic generation from layout JSON.
+Use python-pptx for the maintained default rebuild because it is easy to inspect
+and patch.
 
 Use LibreOffice for:
 

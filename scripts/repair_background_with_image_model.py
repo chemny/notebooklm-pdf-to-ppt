@@ -140,7 +140,7 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--provider", choices=["gemini-native", "openai-image"], required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--base-url", default="https://yunwu.ai")
+    parser.add_argument("--base-url", default=os.environ.get("VISION_API_BASE_URL", "https://api.openai.com"))
     parser.add_argument("--api-key-env", default="VISION_API_KEY")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--size", default="1536x864")

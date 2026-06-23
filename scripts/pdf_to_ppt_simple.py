@@ -127,7 +127,9 @@ def contains_cjk(text: str) -> bool:
 
 
 def font_for_text(text: str) -> str:
-    return DEFAULT_CJK_FONT if contains_cjk(text) else DEFAULT_LATIN_FONT
+    if contains_cjk(text):
+        return DEFAULT_CJK_FONT
+    return first_available_font((DEFAULT_LATIN_FONT, FALLBACK_LATIN_FONT))
 
 
 def classify_text_role(item: dict[str, Any], page_w: int, page_h: int) -> str:
@@ -151,7 +153,7 @@ def apply_font_policy(item: dict[str, Any], page_w: int, page_h: int) -> None:
         else:
             item["font_family"] = first_available_font(PLAYFUL_LATIN_FONTS)
     else:
-        item["font_family"] = DEFAULT_CJK_FONT if contains_cjk(text) else DEFAULT_LATIN_FONT
+        item["font_family"] = font_for_text(text)
 
 
 def clean_text(text: str) -> str:
@@ -243,11 +245,13 @@ def calibrate_font_size(item: dict[str, Any]) -> None:
         # The paddle worker now sizes from MEASURED ink height (style_probe),
         # so trust it and only clamp pathological extremes. The old 0.50/0.54
         # bbox factors halved every glyph and were the main "字号偏小" cause.
-        item["font_size_px"] = round(max(6.0, min(current, height * 1.6)), 2)
-    elif source == "tesseract":
-        factor = 0.78 if role == "title" else 0.82
-        item["font_size_px"] = round(min(current, height * factor), 2)
-
+        if role == "title":
+            max_factor = 1.18
+        elif contains_cjk(str(item.get("text") or "")):
+            max_factor = 0.95
+        else:
+            max_factor = 0.90
+        item["font_size_px"] = round(max(6.0, min(current, height * max_factor)), 2)
 
 def normalize_ocr_slide(page: dict[str, Any]) -> dict[str, Any]:
     page_w = int(page.get("width") or 0)
@@ -328,6 +332,97 @@ def merge_section_numeral_prefix(page: dict[str, Any]) -> None:
         page["texts"] = [item for item in texts if item not in numerals]
 
 
+def can_merge_cjk_short_continuation(prev: dict[str, Any], current: dict[str, Any], page_w: int, page_h: int) -> bool:
+    prev_text = str(prev.get("text") or "").strip()
+    current_text = str(current.get("text") or "").strip()
+    if not prev_text or not current_text:
+        return False
+    if str(prev.get("role") or "") == "title" or str(current.get("role") or "") == "title":
+        return False
+    if prev.get("styleGroup") or current.get("styleGroup") or prev.get("tableRow") or current.get("tableRow"):
+        return False
+    if not contains_cjk(prev_text) or not re.search(r"[\u3400-\u9fff]", current_text):
+        return False
+    current_visible = re.findall(r"[A-Za-z0-9\u3400-\u9fff]", current_text)
+    if len(current_visible) > 3:
+        return False
+    if re.search(r"[。！？.!?…]$", prev_text):
+        return False
+    if re.match(r"^[QA][：:]\s+", current_text) or list_like_text(current_text):
+        return False
+    px = float(prev.get("x") or 0)
+    py = float(prev.get("y") or 0)
+    pw = float(prev.get("width") or 0)
+    ph = float(prev.get("height") or 0)
+    cx = float(current.get("x") or 0)
+    cy = float(current.get("y") or 0)
+    cw = float(current.get("width") or 0)
+    ch = float(current.get("height") or 0)
+    if cy < py:
+        return False
+    vertical_gap = cy - (py + ph)
+    if vertical_gap > max(16.0, max(ph, ch) * 0.35):
+        return False
+    same_left = abs(cx - px) <= max(36.0, page_w * 0.022)
+    centered_tail = abs((cx + cw / 2) - (px + pw / 2)) <= max(90.0, page_w * 0.05)
+    overlap = max(0.0, min(px + pw, cx + cw) - max(px, cx)) / max(1.0, min(pw, cw))
+    return same_left or centered_tail or overlap >= 0.55
+
+
+def merge_cjk_short_continuations(page: dict[str, Any]) -> None:
+    page_w = int(page.get("width") or 0)
+    page_h = int(page.get("height") or 0)
+    items = [dict(item) for item in sorted(page.get("texts", []), key=lambda item: (float(item.get("y") or 0), float(item.get("x") or 0)))]
+    consumed: set[int] = set()
+    repairs: list[dict[str, Any]] = []
+    for idx, current in enumerate(items):
+        if idx in consumed:
+            continue
+        best_idx: int | None = None
+        best_score = 10**9
+        cy = float(current.get("y") or 0)
+        for prev_idx, prev in enumerate(items[:idx]):
+            if prev_idx in consumed:
+                continue
+            if not can_merge_cjk_short_continuation(prev, current, page_w, page_h):
+                continue
+            score = abs(float(current.get("x") or 0) - float(prev.get("x") or 0)) + abs(cy - float(prev.get("y") or 0)) * 0.2
+            if score < best_score:
+                best_score = score
+                best_idx = prev_idx
+        if best_idx is None:
+            continue
+        prev = items[best_idx]
+        old_text = str(prev.get("text") or "")
+        x1 = min(float(prev.get("x") or 0), float(current.get("x") or 0))
+        y1 = min(float(prev.get("y") or 0), float(current.get("y") or 0))
+        x2 = max(float(prev.get("x") or 0) + float(prev.get("width") or 0), float(current.get("x") or 0) + float(current.get("width") or 0))
+        y2 = max(float(prev.get("y") or 0) + float(prev.get("height") or 0), float(current.get("y") or 0) + float(current.get("height") or 0))
+        prev["text"] = f"{clean_text(old_text)}\n{clean_text(str(current.get('text') or ''))}"
+        prev["x"] = round(x1, 2)
+        prev["y"] = round(y1, 2)
+        prev["width"] = round(x2 - x1, 2)
+        prev["height"] = round(y2 - y1, 2)
+        prev["source"] = "cjk_short_continuation"
+        prev["textSource"] = "ocr_cjk_short_continuation"
+        prev["lineBreakSource"] = "ocr_visible_rows"
+        prev["word_wrap"] = True
+        prev.setdefault("word_boxes", []).extend(current.get("word_boxes") or [current])
+        consumed.add(idx)
+        repairs.append(
+            {
+                "type": "cjk_short_continuation_merge",
+                "mergedText": prev["text"],
+                "texts": [old_text, current.get("text")],
+                "reason": "OCR split a short CJK tail onto the next visual row inside the same text container; merge into one editable text box while preserving the original visible row break.",
+            }
+        )
+    if consumed:
+        page["texts"] = [item for idx, item in enumerate(items) if idx not in consumed]
+    if repairs:
+        page.setdefault("layout_repairs", []).extend(repairs)
+
+
 def merge_primary_top_band_heading(page: dict[str, Any]) -> None:
     page_h = int(page.get("height") or 0)
     if not page_h:
@@ -342,9 +437,6 @@ def merge_primary_top_band_heading(page: dict[str, Any]) -> None:
     top_text = " ".join(str(item.get("text") or "") for item in top_items)
     if "Key" not in top_text and not re.search(r"[一二三四五六七八九十]+、", top_text):
         return
-    if any(str(item.get("source") or "") == "tesseract_top_band" for item in top_items):
-        return
-
     # Merge a heading's OWN fragments only. Anchor on the fragment that carries
     # the heading signal (a section numeral "X、", else "Key"), then extend to
     # neighbours that are both horizontally contiguous (small gap) AND similar
@@ -964,7 +1056,9 @@ def font_fit_candidates(item: dict[str, Any]) -> tuple[str, ...]:
         return (current if current in FONT_FILES else DEFAULT_CJK_FONT,)
     if role == "title":
         return ("Comic Sans MS", "Chalkboard SE", "Arial", "Times New Roman")
-    return LATIN_FONT_FIT_CANDIDATES
+    current = str(item.get("font_family") or font_for_text(text))
+    candidates = [current if current in FONT_FILES else FALLBACK_LATIN_FONT, FALLBACK_LATIN_FONT]
+    return tuple(dict.fromkeys(candidates))
 
 
 def fit_font_for_item(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -985,10 +1079,17 @@ def fit_font_for_item(item: dict[str, Any]) -> dict[str, Any] | None:
         bool(item.get("styleGroup")) and not contains_cjk(text)
     )
     best: dict[str, Any] | None = None
+    role = str(item.get("role") or "")
     for family in font_fit_candidates(item):
         trial_bold_values = (False, True) if can_fit_weight else (original_bold,)
         for trial_bold in trial_bold_values:
-            for scale in (0.82, 0.88, 0.94, 1.0, 1.06, 1.12, 1.2):
+            if role == "title":
+                scales = (0.82, 0.88, 0.94, 1.0, 1.06, 1.12)
+            elif contains_cjk(text):
+                scales = (0.84, 0.90, 0.96, 1.0)
+            else:
+                scales = (0.72, 0.78, 0.84, 0.90, 0.96, 1.0)
+            for scale in scales:
                 trial_size = max(6.0, base_size * scale)
                 metrics = render_font_metrics(fit_text, family, trial_size, trial_bold)
                 if not metrics:
@@ -998,7 +1099,7 @@ def fit_font_for_item(item: dict[str, Any]) -> dict[str, Any] | None:
                 density_error = abs(float(metrics["tightInkDensity"]) - target_density)
                 penalty = 0.0
                 if family == "Times New Roman" and (contains_cjk(text) or str(item.get("role") or "") != "title"):
-                    penalty += 0.12
+                    penalty += 0.5
                 if family in {"Comic Sans MS", "Chalkboard SE"} and str(item.get("role") or "") != "title":
                     penalty += 0.08
                 if trial_bold and target_density < 0.19:
@@ -1017,6 +1118,9 @@ def fit_font_for_item(item: dict[str, Any]) -> dict[str, Any] | None:
                 }
                 if best is None or candidate["score"] < best["score"]:
                     best = candidate
+    if best and role != "title":
+        if float(best.get("widthRatio") or 0) > 1.35 or float(best.get("score") or 0) > 0.32:
+            return None
     return best
 
 
@@ -1091,263 +1195,6 @@ def sample_background_color(image: Image.Image, box: tuple[int, int, int, int], 
     bright = [p for p in samples if sum(p) > 540]
     pool = bright or samples
     return tuple(int(sum(p[i] for p in pool) / len(pool)) for i in range(3))
-
-
-def tesseract_ocr(image_path: Path, lang: str, psm: int, min_conf: int) -> dict[str, Any]:
-    from PIL import Image
-
-    image = Image.open(image_path).convert("RGB")
-    result = subprocess.run(
-        ["tesseract", str(image_path), "stdout", "-l", lang, "--psm", str(psm), "tsv"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    rows = [line.split("\t") for line in result.stdout.splitlines() if line.strip()]
-    if not rows:
-        return {"width": image.width, "height": image.height, "texts": [], "mask_words": []}
-    header = rows[0]
-    records: list[dict[str, str]] = []
-    for row in rows[1:]:
-        if len(row) < len(header):
-            row.extend([""] * (len(header) - len(row)))
-        records.append(dict(zip(header, row)))
-    words: list[dict[str, Any]] = []
-    grouped: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
-    for record in records:
-        raw_text = record.get("text") or ""
-        text = clean_text(raw_text)
-        if not text:
-            continue
-        try:
-            conf = float(record.get("conf", "-1"))
-        except (ValueError, TypeError):
-            conf = -1.0
-        try:
-            x, y, w, h = (int(float(record[k])) for k in ("left", "top", "width", "height"))
-        except (ValueError, KeyError):
-            continue
-        if w <= 0 or h <= 0:
-            continue
-        word = {
-            "text": text,
-            "confidence": conf,
-            "x": x,
-            "y": y,
-            "width": w,
-            "height": h,
-            "block": int(record.get("block_num", "0") or 0),
-            "paragraph": int(record.get("par_num", "0") or 0),
-            "line": int(record.get("line_num", "0") or 0),
-        }
-        words.append(word)
-        if conf >= min_conf:
-            grouped.setdefault((word["block"], word["paragraph"], word["line"]), []).append(word)
-
-    lines: list[dict[str, Any]] = []
-    for key, line_words in grouped.items():
-        line_words.sort(key=lambda item: item["x"])
-        text = clean_text(" ".join(item["text"] for item in line_words))
-        x1 = min(item["x"] for item in line_words)
-        y1 = min(item["y"] for item in line_words)
-        x2 = max(item["x"] + item["width"] for item in line_words)
-        y2 = max(item["y"] + item["height"] for item in line_words)
-        conf = sum(item["confidence"] for item in line_words) / len(line_words)
-        if not useful_text(text, conf, x2 - x1, y2 - y1):
-            continue
-        height = y2 - y1
-        lines.append(
-            {
-                "text": text,
-                "confidence": round(conf, 2),
-                "x": x1,
-                "y": y1,
-                "width": x2 - x1,
-                "height": height,
-                "font_size_px": round(height * 0.86, 2),
-                "font_family": font_for_text(text),
-                "color": text_color_from_region(image, (x1, y1, x2, y2)),
-                "source": "tesseract",
-                "word_boxes": [
-                    {
-                        "text": item["text"],
-                        "x": item["x"],
-                        "y": item["y"],
-                        "width": item["width"],
-                        "height": item["height"],
-                        "confidence": item["confidence"],
-                    }
-                    for item in line_words
-                ],
-            }
-        )
-    return {"width": image.width, "height": image.height, "texts": lines, "mask_words": words}
-
-
-def join_ocr_words(words: list[str]) -> str:
-    text = ""
-    for word in words:
-        if not word:
-            continue
-        if not text:
-            text = word
-            continue
-        if re.match(r"^[，。！？：；、）\]\)]", word):
-            text += word
-        elif re.search(r"[\u3400-\u9fff、，。！？：；]$", text) and re.match(r"^[\u3400-\u9fff]", word):
-            text += word
-        elif text.endswith("(") or text.endswith("（"):
-            text += word
-        else:
-            text += " " + word
-    return clean_text(text)
-
-
-def tesseract_top_band_lines(image_path: Path, lang: str, min_conf: int) -> list[dict[str, Any]]:
-    from PIL import Image
-
-    image = Image.open(image_path).convert("RGB")
-    try:
-        result = subprocess.run(
-            ["tesseract", str(image_path), "stdout", "-l", lang, "--psm", "11", "tsv"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    rows = [line.split("\t") for line in result.stdout.splitlines() if line.strip()]
-    if not rows:
-        return []
-    header = rows[0]
-    words: list[dict[str, Any]] = []
-    top_limit = image.height * 0.15
-    for row in rows[1:]:
-        if len(row) < len(header):
-            row.extend([""] * (len(header) - len(row)))
-        record = dict(zip(header, row))
-        text = clean_text(record.get("text") or "")
-        if not text:
-            continue
-        try:
-            conf = float(record.get("conf", "-1"))
-            x = int(float(record.get("left", "0")))
-            y = int(float(record.get("top", "0")))
-            w = int(float(record.get("width", "0")))
-            h = int(float(record.get("height", "0")))
-        except (TypeError, ValueError):
-            continue
-        if conf < min_conf or w <= 0 or h <= 0 or y > top_limit:
-            continue
-        words.append({"text": text, "confidence": conf, "x": x, "y": y, "width": w, "height": h})
-    if not words:
-        return []
-
-    words.sort(key=lambda item: (item["y"], item["x"]))
-    rows_grouped: list[list[dict[str, Any]]] = []
-    for word in words:
-        placed = False
-        wy1, wy2 = word["y"], word["y"] + word["height"]
-        for group in rows_grouped:
-            gy1 = min(item["y"] for item in group)
-            gy2 = max(item["y"] + item["height"] for item in group)
-            if overlap_ratio(wy1, wy2, gy1, gy2) >= 0.35:
-                group.append(word)
-                placed = True
-                break
-        if not placed:
-            rows_grouped.append([word])
-
-    lines: list[dict[str, Any]] = []
-    for group in rows_grouped:
-        group.sort(key=lambda item: item["x"])
-        x1 = min(item["x"] for item in group)
-        y1 = min(item["y"] for item in group)
-        x2 = max(item["x"] + item["width"] for item in group)
-        y2 = max(item["y"] + item["height"] for item in group)
-        text = join_ocr_words([item["text"] for item in group])
-        visible = re.findall(r"[A-Za-z0-9\u3400-\u9fff]", text)
-        if len(visible) < 4:
-            continue
-        lines.append(
-            {
-                "text": text,
-                "confidence": round(sum(item["confidence"] for item in group) / len(group), 2),
-                "x": x1,
-                "y": y1,
-                "width": x2 - x1,
-                "height": y2 - y1,
-                "font_size_px": round((y2 - y1) * 0.62, 2),
-                "font_family": font_for_text(text),
-                "color": text_color_from_region(image, (x1, y1, x2, y2)),
-                "source": "tesseract_top_band",
-                "textSource": "ocr_repair",
-                "repairReason": "top_band_heading_repair",
-                "word_boxes": group,
-            }
-        )
-    return sorted(lines, key=lambda item: (item["y"], item["x"]))
-
-
-def valid_top_band_repair(text: str) -> bool:
-    clean = clean_text(text)
-    if re.search(r"[《]{1}|[a-zA-Z]\s*[《]|Keyi|[A-Z]\s*[一—-]{2,}$", clean):
-        return False
-    if re.search(r"\(Key\s+[A-Za-z ]+\)$", clean):
-        if re.match(r"^[一二三四五六七八九十]+、[\u3400-\u9fff]{2,}\s+\(Key\s+[A-Za-z ]+\)$", clean):
-            return True
-        return False
-    if "Unit" in clean:
-        return bool(re.match(r"^Unit\s+\d+\s+.+", clean))
-    return False
-
-
-def repair_top_band_headings(slides: list[dict[str, Any]], lang: str, min_conf: int) -> None:
-    for page in slides:
-        image_path = Path(page["image"])
-        repaired_lines = tesseract_top_band_lines(image_path, lang, min_conf)
-        if not repaired_lines:
-            continue
-        page_w = int(page.get("width") or 0)
-        page_h = int(page.get("height") or 0)
-        top_limit = page_h * 0.15
-        keep_texts = [item for item in page.get("texts", []) if float(item.get("y") or 0) > top_limit]
-        replaced_texts = [item for item in page.get("texts", []) if float(item.get("y") or 0) <= top_limit]
-        if not replaced_texts:
-            continue
-        repaired_text = " ".join(str(item.get("text") or "") for item in repaired_lines)
-        if not valid_top_band_repair(repaired_text):
-            page.setdefault("ocr_repair_candidates", []).append(
-                {
-                    "type": "top_band_heading_repair",
-                    "engine": "tesseract",
-                    "status": "rejected",
-                    "candidateText": repaired_text,
-                    "reason": "secondary_top_band_ocr_failed_heading_format_gate",
-                }
-            )
-            continue
-        for line in repaired_lines:
-            apply_font_policy(line, page_w, page_h)
-            calibrate_font_size(line)
-        page["texts"] = keep_texts + repaired_lines
-        page.setdefault("ocr_repairs", []).append(
-            {
-                "type": "top_band_heading_repair",
-                "engine": "tesseract",
-                "replaced": [
-                    {"text": item.get("text"), "x": item.get("x"), "y": item.get("y"), "width": item.get("width"), "height": item.get("height")}
-                    for item in replaced_texts
-                ],
-                "inserted": [
-                    {"text": item.get("text"), "x": item.get("x"), "y": item.get("y"), "width": item.get("width"), "height": item.get("height")}
-                    for item in repaired_lines
-                ],
-                "reason": "Top-band headings are high-value anchors. Tesseract is used only as a narrow secondary check when PaddleOCR misses heading prefixes, punctuation, or fragments.",
-            }
-        )
 
 
 def default_paddle_python() -> Path | None:
@@ -1968,19 +1815,18 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--pages", help="1-based pages, e.g. 1,2,5-7")
     parser.add_argument("--dpi", type=int, default=180)
-    parser.add_argument("--ocr", choices=["auto", "paddle", "tesseract"], default="auto")
+    parser.add_argument("--ocr", choices=["auto", "paddle"], default="auto")
     parser.add_argument("--lang", default="chi_sim+eng")
     parser.add_argument("--psm", type=int, default=11)
     parser.add_argument("--min-conf", type=int, default=35)
     parser.add_argument("--ocr-timeout", type=int, default=300)
     parser.add_argument("--background", choices=["original", "clean-text", "local-clean", "model-clean", "auto"], default="auto")
     parser.add_argument("--mask-expand", type=int, default=6)
-    # Defaults match the verified working setup on this machine (yunwu gpt-image-2
-    # via the OpenAI image-edit endpoint). gpt-image-2-all routes to a generation
-    # endpoint and times out on edits; gemini-native needs a different key.
+    # Default to the OpenAI image-edit endpoint for portability. Users with a
+    # compatible proxy can set VISION_API_BASE_URL or pass --model-clean-base-url.
     parser.add_argument("--model-provider", choices=["gemini-native", "openai-image"], default="openai-image")
     parser.add_argument("--model-clean-model", default="gpt-image-2")
-    parser.add_argument("--model-clean-base-url", default="https://yunwu.ai")
+    parser.add_argument("--model-clean-base-url", default=os.environ.get("VISION_API_BASE_URL", "https://api.openai.com"))
     parser.add_argument("--model-clean-api-key-env", default="VISION_API_KEY")
     parser.add_argument("--model-clean-timeout", type=int, default=240)
     parser.add_argument("--model-clean-size", default="1536x864")
@@ -2011,26 +1857,17 @@ def main() -> int:
         try:
             slides = run_paddle_worker(rendered, args.ocr_timeout)
         except Exception as exc:
-            if args.ocr == "paddle":
-                raise
-            print(f"[warn] PaddleOCR worker failed: {exc}. Falling back to Tesseract.", file=sys.stderr)
+            raise RuntimeError(f"PaddleOCR worker failed in the default flow: {exc}") from exc
 
     if not slides:
-        for item in rendered:
-            image_path = Path(item["image"])
-            print(f"[info] OCR page {item['page_number']} with Tesseract CLI", file=sys.stderr)
-            parsed = tesseract_ocr(image_path, lang=args.lang, psm=args.psm, min_conf=args.min_conf)
-            parsed.update({"page_number": item["page_number"], "image": str(image_path)})
-            slides.append(parsed)
-    elif args.ocr in {"auto", "paddle"}:
-        print("[info] repair top-band headings with narrow Tesseract check", file=sys.stderr)
-        repair_top_band_headings(slides, args.lang, args.min_conf)
+        raise RuntimeError("PaddleOCR produced no slides in the default flow.")
 
     slides = [normalize_ocr_slide(page) for page in slides]
     for page in slides:
         merge_section_numeral_prefix(page)
         merge_primary_top_band_heading(page)
         mark_table_rows(page)
+        merge_cjk_short_continuations(page)
         merge_paragraph_text_items(page)
         apply_visual_style_evidence(page)
         apply_group_style_consistency(page)
