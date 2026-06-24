@@ -16,6 +16,7 @@ Output is JSON on stdout:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -69,14 +70,37 @@ def useful_text(text: str, conf: float, width: float, height: float) -> bool:
 
 
 def make_ocr() -> PaddleOCR:
-    return PaddleOCR(
-        text_detection_model_name="PP-OCRv6_small_det",
-        text_recognition_model_name="PP-OCRv6_small_rec",
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        text_det_limit_side_len=1920,
-    )
+    common = {
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        "text_det_limit_side_len": 1920,
+    }
+    candidates = [
+        (
+            os.environ.get("PADDLEOCR_DET_MODEL", "PP-OCRv6_small_det"),
+            os.environ.get("PADDLEOCR_REC_MODEL", "PP-OCRv6_small_rec"),
+        ),
+        ("PP-OCRv5_mobile_det", "PP-OCRv5_mobile_rec"),
+    ]
+    seen: set[tuple[str, str]] = set()
+    last_error: Exception | None = None
+    for det_model, rec_model in candidates:
+        pair = (det_model, rec_model)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        try:
+            print(f"[info] PaddleOCR models det={det_model} rec={rec_model}", file=sys.stderr)
+            return PaddleOCR(
+                text_detection_model_name=det_model,
+                text_recognition_model_name=rec_model,
+                **common,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep fallback compatible across PaddleOCR versions
+            last_error = exc
+            print(f"[warn] PaddleOCR model pair failed det={det_model} rec={rec_model}: {exc}", file=sys.stderr)
+    raise RuntimeError(f"No supported PaddleOCR model pair found: {last_error}") from last_error
 
 
 def parse_result_json(result: Any) -> dict[str, Any]:

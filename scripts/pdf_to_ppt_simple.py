@@ -3,7 +3,7 @@
 
 This is the default small-tool flow for notebooklm-pdf-to-ppt:
 PDF -> rendered page PNGs -> OCR lines -> locally cleaned background ->
-python-pptx editable text overlay -> LibreOffice preview.
+python-pptx editable text overlay.
 
 It intentionally avoids the older multi-model fusion stack. The goal is to
 make OCR quality and rebuild quality easy to inspect independently.
@@ -782,6 +782,7 @@ def render_pdf(pdf: Path, out_dir: Path, dpi: int, pages_arg: str | None) -> lis
             print(f"[info] reuse cached render for page {idx + 1}", file=sys.stderr)
             rendered.append({"page_number": idx + 1, "image": str(path)})
             continue
+        print(f"[info] render page {idx + 1}/{len(pages)}", file=sys.stderr)
         subprocess.run(
             [
                 "pdftoppm",
@@ -1211,24 +1212,35 @@ def default_paddle_python() -> Path | None:
     return None
 
 
-def run_paddle_worker(rendered: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
-    python = default_paddle_python()
-    if not python:
-        raise RuntimeError("PaddleOCR Python runtime not found. Set PADDLEOCR_PYTHON.")
-    worker = Path(__file__).with_name("ocr_paddle_worker.py")
+def run_paddle_worker_batch(python: Path, worker: Path, rendered: list[dict[str, Any]], timeout: int) -> list[dict[str, Any]]:
+    if not rendered:
+        return []
     payload = json.dumps({"images": rendered}, ensure_ascii=False)
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
-    result = subprocess.run(
-        [str(python), str(worker)],
-        input=payload,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
+    try:
+        result = subprocess.run(
+            [str(python), str(worker)],
+            input=payload,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        raise RuntimeError(
+            "PaddleOCR worker failed "
+            f"returncode={exc.returncode} stderr={stderr[-4000:]} stdout={stdout[-1000:]}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        stderr = (exc.stderr or b"")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"PaddleOCR worker timed out after {timeout}s stderr={str(stderr)[-4000:]}") from exc
     json_line = ""
     for line in reversed(result.stdout.splitlines()):
         if line.strip().startswith("{"):
@@ -1240,6 +1252,29 @@ def run_paddle_worker(rendered: list[dict[str, Any]], timeout: int) -> list[dict
     if not data.get("ok"):
         raise RuntimeError("PaddleOCR worker returned ok=false")
     return data.get("slides") or []
+
+
+def run_paddle_worker(rendered: list[dict[str, Any]], timeout: int, batch_size: int) -> list[dict[str, Any]]:
+    python = default_paddle_python()
+    if not python:
+        raise RuntimeError("PaddleOCR Python runtime not found. Set PADDLEOCR_PYTHON.")
+    worker = Path(__file__).with_name("ocr_paddle_worker.py")
+    if batch_size <= 0:
+        batch_size = max(1, len(rendered))
+    else:
+        batch_size = max(1, int(batch_size))
+    slides: list[dict[str, Any]] = []
+    total_batches = (len(rendered) + batch_size - 1) // batch_size
+    for batch_index, start in enumerate(range(0, len(rendered), batch_size), start=1):
+        chunk = rendered[start : start + batch_size]
+        first_page = chunk[0]["page_number"]
+        last_page = chunk[-1]["page_number"]
+        print(
+            f"[info] OCR batch {batch_index}/{total_batches} pages {first_page}-{last_page} with {python}",
+            file=sys.stderr,
+        )
+        slides.extend(run_paddle_worker_batch(python, worker, chunk, timeout))
+    return slides
 
 
 def remove_notebooklm_watermark(
@@ -1562,6 +1597,51 @@ def model_clean_background(
             )
             return
     page_out.mkdir(parents=True, exist_ok=True)
+    if provider == "codex-image":
+        prompt = model_clean_prompt(page)
+        request = {
+            "ok": False,
+            "provider": "codex-image",
+            "requires_codex_image_tool": True,
+            "page": page.get("page_number"),
+            "image": str(page["image"]),
+            "expected_output": str(page_out / f"{model}.clean_background.png"),
+            "prompt": prompt,
+            "instructions": [
+                "Use the Codex built-in image editing tool on the source image.",
+                "Edit the original image directly; do not regenerate or redesign the slide.",
+                "Remove only the OCR-listed text pixels and keep containers, icons, illustrations, cards, panels, composition, aspect ratio, and canvas geometry unchanged.",
+                "Save the resulting clean background to expected_output, then rerun the PPTX rebuild with this cached background.",
+            ],
+        }
+        request_json = page_out / f"{model}.codex_image_request.json"
+        request_md = page_out / f"{model}.codex_image_request.md"
+        request_json.write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        request_md.write_text(
+            "\n".join(
+                [
+                    "# Codex Image Clean Request",
+                    "",
+                    f"- Page: {page.get('page_number')}",
+                    f"- Source image: `{page['image']}`",
+                    f"- Expected output: `{request['expected_output']}`",
+                    "",
+                    "## Prompt",
+                    "",
+                    prompt,
+                    "",
+                    "## Rules",
+                    "",
+                    "- Edit the original image directly.",
+                    "- Remove only the OCR-listed text pixels.",
+                    "- Preserve all non-text visuals and canvas geometry.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        page["codex_image_clean_request"] = str(request_json)
+        raise RuntimeError(f"codex-image clean requires Codex image tool orchestration: {request_json}")
     cmd = [
         sys.executable,
         str(script),
@@ -1710,44 +1790,6 @@ def build_pptx(layout: dict[str, Any], pptx_path: Path, background_key: str) -> 
     prs.save(pptx_path)
 
 
-def render_preview(pptx_path: Path, preview_dir: Path) -> list[str]:
-    def which(binary: str) -> str | None:
-        try:
-            result = subprocess.run(
-                ["/bin/zsh", "-lc", f"command -v {binary}"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        path = result.stdout.strip()
-        return path or None
-
-    soffice = which("soffice")
-    pdftoppm = which("pdftoppm")
-    if not soffice or not pdftoppm:
-        return []
-    pdf_dir = preview_dir / "pdf"
-    png_dir = preview_dir / "png"
-    pdf_dir.mkdir(parents=True, exist_ok=True)
-    png_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(pdf_dir), str(pptx_path)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    pdf_path = pdf_dir / f"{pptx_path.stem}.pdf"
-    if not pdf_path.exists():
-        return []
-    prefix = png_dir / "preview"
-    subprocess.run([pdftoppm, "-png", "-r", "160", str(pdf_path), str(prefix)], check=True, timeout=120)
-    return [str(path) for path in sorted(png_dir.glob("preview-*.png"))]
-
-
 def page_qa_summary(page: dict[str, Any]) -> dict[str, Any]:
     texts = page.get("texts", [])
     font_fit_count = sum(1 for item in texts if item.get("fontFit"))
@@ -1820,24 +1862,19 @@ def main() -> int:
     parser.add_argument("--psm", type=int, default=11)
     parser.add_argument("--min-conf", type=int, default=35)
     parser.add_argument("--ocr-timeout", type=int, default=300)
+    parser.add_argument("--ocr-batch-size", type=int, default=0, help="pages per OCR worker; 0 means all selected pages in one worker")
     parser.add_argument("--background", choices=["original", "clean-text", "local-clean", "model-clean", "auto"], default="auto")
     parser.add_argument("--mask-expand", type=int, default=6)
     # Default to the OpenAI image-edit endpoint for portability. Users with a
     # compatible proxy can set VISION_API_BASE_URL or pass --model-clean-base-url.
-    parser.add_argument("--model-provider", choices=["gemini-native", "openai-image"], default="openai-image")
-    parser.add_argument("--model-clean-model", default="gpt-image-2")
+    parser.add_argument("--model-provider", choices=["codex-image", "gemini-native", "openai-image"], default="codex-image")
+    parser.add_argument("--model-clean-model", default="codex-image")
     parser.add_argument("--model-clean-base-url", default=os.environ.get("VISION_API_BASE_URL", "https://api.openai.com"))
     parser.add_argument("--model-clean-api-key-env", default="VISION_API_KEY")
     parser.add_argument("--model-clean-timeout", type=int, default=240)
     parser.add_argument("--model-clean-size", default="1536x864")
     parser.add_argument("--model-clean-insecure", action="store_true")
     parser.add_argument("--model-clean-fallback", choices=["fail", "local-clean", "original"], default="local-clean")
-    # Inspection previews are off by default (they cost a slow LibreOffice +
-    # pdftoppm pass and do not affect the .pptx output). Opt in with --preview
-    # when you need before/after comparison images. --no-preview kept for
-    # backward compatibility.
-    parser.add_argument("--preview", action="store_true", help="export inspection preview PNGs (off by default)")
-    parser.add_argument("--no-preview", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     pdf = Path(args.pdf).expanduser().resolve()
@@ -1846,7 +1883,6 @@ def main() -> int:
     ocr_dir = out_dir / "02_ocr"
     clean_dir = out_dir / "03_cleaned"
     pptx_dir = out_dir / "04_pptx"
-    preview_dir = out_dir / "05_previews"
     model_clean_dir = out_dir / "03_model_cleaned"
 
     rendered = render_pdf(pdf, rendered_dir, args.dpi, args.pages)
@@ -1855,7 +1891,7 @@ def main() -> int:
     if args.ocr in {"auto", "paddle"}:
         print(f"[info] OCR {len(rendered)} page(s) with PaddleOCR worker", file=sys.stderr)
         try:
-            slides = run_paddle_worker(rendered, args.ocr_timeout)
+            slides = run_paddle_worker(rendered, args.ocr_timeout, args.ocr_batch_size)
         except Exception as exc:
             raise RuntimeError(f"PaddleOCR worker failed in the default flow: {exc}") from exc
 
@@ -1950,11 +1986,6 @@ def main() -> int:
     background_key = "clean_background" if args.background in {"clean-text", "local-clean", "model-clean", "auto"} else "image"
     print(f"[info] build pptx at {pptx_path}", file=sys.stderr)
     build_pptx(layout, pptx_path, background_key)
-    if args.preview and not args.no_preview:
-        print("[info] render preview", file=sys.stderr)
-        previews = render_preview(pptx_path, preview_dir)
-    else:
-        previews = []
 
     print(
         json.dumps(
@@ -1965,7 +1996,6 @@ def main() -> int:
                 "layout": str(layout_path),
                 "qa_summary": str(qa_path),
                 "pptx": str(pptx_path),
-                "previews": previews,
                 "work_dir": str(out_dir),
                 "qa_totals": qa_summary.get("totals"),
             },

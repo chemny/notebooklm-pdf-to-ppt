@@ -250,16 +250,16 @@ Output:
 
 - `editable_text_overlay.pptx` or equivalent editable PPTX.
 
-## Stage 12: Preview Rendering
+## Stage 12: PPTX Inspection
 
 Actions:
 
-- Render the rebuilt PPTX to PDF/PNG previews.
+- Open or inspect the rebuilt PPTX.
 - Inspect representative pages visually before full-deck conversion.
 
 Output:
 
-- Preview screenshots for QA.
+- Inspection notes for QA.
 
 ## Stage 13: QA And Repair
 
@@ -298,9 +298,9 @@ Output:
 
 Actions:
 
-- Render final preview pages.
+- Inspect final PPTX pages.
 - Report known limitations by page type.
-- Save final PPTX and supporting layout/preview artifacts.
+- Save final PPTX and supporting layout/diagnostic artifacts.
 
 Output:
 

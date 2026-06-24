@@ -11,7 +11,7 @@ Use this skill for the **editable reconstruction** problem: converting flattened
 This skill is separate from `notebooklm-course-studio`:
 
 - `notebooklm-course-studio` owns NotebookLM content workflow: source import, content generation, artifact revision, and export.
-- `notebooklm-pdf-to-ppt` owns post-export reconstruction: parse pages, clean backgrounds, rebuild editable PPTX, preview, and diagnose fidelity problems.
+- `notebooklm-pdf-to-ppt` owns post-export reconstruction: parse pages, clean backgrounds, rebuild editable PPTX, and diagnose fidelity problems.
 
 Do not use this skill to ask NotebookLM to generate course content, podcasts, study guides, or new slide artifacts. Use it only after a PDF/PPTX/image export already exists or when the user explicitly asks for editable reconstruction.
 
@@ -21,25 +21,24 @@ This skill is under active development. The default path is now a small, inspect
 
 Known current conclusions:
 
-- PaddleOCR is the only OCR engine in the default main flow. Representative tests showed the removed secondary OCR path did not change final text, geometry, or preview output; it only added rejected candidates and maintenance noise.
-- Current default PaddleOCR models are the official PP-OCRv6 small models: `PP-OCRv6_small_det` for text detection and `PP-OCRv6_small_rec` for text recognition. Keep official model names exactly as published by PaddleOCR; do not rename or alias local model identifiers.
+- PaddleOCR is the only OCR engine in the default main flow. Representative tests showed the removed secondary OCR path did not change final text, geometry, or PPTX output; it only added rejected candidates and maintenance noise.
+- Preferred PaddleOCR models are the official PP-OCRv6 small models: `PP-OCRv6_small_det` for text detection and `PP-OCRv6_small_rec` for text recognition. If the installed PaddleOCR runtime does not register v6 small models, fall back to official `PP-OCRv5_mobile_det` and `PP-OCRv5_mobile_rec`. Keep official model names exactly as published by PaddleOCR; do not rename or alias local model identifiers.
 - Do not use a secondary OCR fallback for top-band heading repair in the default flow. Wrong section numerals are worse than missing numerals; handle heading numbering only when PaddleOCR or another reliable evidence source provides it.
 - When OCR splits a short CJK tail onto the next row inside the same visual text container, merge it into one editable text box and preserve the original visible row break. Do not leave the tail as an independent text object, and do not force a single long CJK line that PowerPoint may fail to wrap.
 - Font fitting is conservative for body text: do not enlarge body text during render-fit, do not switch body Latin text to serif fonts just because a width score looks better, and reject low-confidence font-fit candidates instead of committing bad typography to layout JSON.
 - CJK body font-fit must preserve readability. Do not shrink CJK body text below a conservative floor merely to match rendered width; let the final fit-to-box cap handle overflow.
-- PPTXGenJS and LibreOffice rendering differences are secondary. When structure, text, coordinates, or grouping are wrong, the root cause is the layout/fusion layer, not the PPTX renderer.
-- LibreOffice is useful for preview, conversion, and round-trip validation. PPTXGenJS is useful for deterministic PPTX generation from layout JSON.
+- PPTX renderer differences are secondary. When structure, text, coordinates, or grouping are wrong, the root cause is the layout/fusion layer, not the PPTX renderer.
 
 ## Operating Principle
 
-The user should interact by chat. Internally, run scripts and models as needed, but present the result as visual previews and concise diagnoses.
+The user should interact by chat. Internally, run scripts and models as needed, but present the result as output paths and concise diagnoses.
 
 Always separate the two failure domains:
 
 - **OCR / parsing / fusion** owns text content, reading order, grouping, coordinates, font size, color, style evidence, and whether text should be editable.
 - **PPTX rebuild** owns unit conversion, font substitution, text-box margins, line spacing, paragraph spacing, and renderer-specific output.
 
-Do not let one layer compensate for the other. If OCR is wrong, fix OCR/parsing/fusion. If layout JSON is right but preview is wrong, fix the renderer.
+Do not let one layer compensate for the other. If OCR is wrong, fix OCR/parsing/fusion. If layout JSON is right but PPTX output is wrong, fix the renderer.
 
 ### Core reconstruction principles
 
@@ -93,26 +92,30 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_simple.py \
 ```
 
 To force one mode for the whole deck, pass `--background local-clean` or
-`--background model-clean`. For model-clean, the portable default is
-**`gpt-image-2`** via the **`openai-image`** provider using an image-edit
-endpoint. Requires `VISION_API_KEY`; compatible proxy providers can be selected
-with `VISION_API_BASE_URL` or `--model-clean-base-url`:
+`--background model-clean`. For `model-clean`, the default provider is
+**`codex-image`**: in Codex chat, the agent should use the built-in image tool
+to edit the original slide image directly. The script cannot call Codex's
+built-in image tool by itself, so it writes a `codex_image_request` package for
+the page and then follows `--model-clean-fallback` for unattended runs.
+
+For fully automated CLI/API runs, explicitly select an image-edit API backend
+such as `openai-image` with `gpt-image-2-all`:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_simple.py \
   --pdf /path/to/source.pdf --pages 1,2 --output-dir /path/to/output \
   --ocr auto --background model-clean \
-  --model-provider openai-image --model-clean-model gpt-image-2 \
+  --model-provider openai-image --model-clean-model gpt-image-2-all \
   --model-clean-fallback local-clean
 ```
 
 This default path is intentionally simple:
 
 1. Render selected PDF pages into PNGs. **Cached**: existing `slide_NNN.png` is reused.
-2. OCR text lines and coordinates with PaddleOCR worker by default (`.venv-paddleocr`).
+2. OCR text lines and coordinates with PaddleOCR worker by default (`.venv-paddleocr`). By default (`--ocr-batch-size 0`) one worker handles all selected pages so the model loads once; set a smaller batch size such as `3` or `1` only when a machine hits OCR memory limits.
 3. Recover style (color/size/weight) per region via `scripts/style_probe.py`, group/segment text, fit each text size to its box, then clean the background. With `--background auto` each page is routed to local-clean or model-clean automatically. **model-clean is cached**: an existing cleaned background for a page+model is reused (no re-billing).
 4. **Always** strip the NotebookLM watermark from the cleaned background (`strip_watermark_from_background`), then rebuild a PPTX with the clean background and editable text boxes.
-5. Previews are **off by default**. Pass `--preview` to render LibreOffice + `pdftoppm` PNGs for before/after comparison; it does not affect the `.pptx`.
+5. The maintained flow writes the editable PPTX plus layout and QA JSON. It does not render PPTX images.
 
 Background modes:
 
@@ -126,7 +129,7 @@ Background modes:
   model-clean.
 - `original`: keep the original page image as background and overlay editable text.
 - `local-clean`: fast local background cleanup by covering text regions with sampled neighboring colors. Stable, no model call. **Safe-cover rule**: it only covers a region that has a surviving editable text replacement (`_has_replacement`); a region OCR'd into the mask but dropped from final `texts` (e.g. a big decorative number) is left in the background so it is never erased-without-replacement. Can still leave faint pale blocks where text sits on a textured/illustrated background.
-- `model-clean`: high-quality background cleanup through an image model. It sends the original page image plus a text-removal prompt listing OCR text. Use it for illustrated/textured pages where local cleanup is visibly insufficient.
+- `model-clean`: high-quality background cleanup through an image-editing backend. In Codex chat, default to `codex-image` and use the built-in image tool on the original page image. For unattended CLI/API runs, use `openai-image` or `gemini-native` explicitly.
 
 Follow `references/editable-ppt-workflow.md` for the broader staged process and `references/editable-ppt-rules.md` for quality rules.
 
@@ -162,7 +165,7 @@ Practical execution order:
    - Apply renderer-calibrated OCR font-size estimates before PPTX generation.
    - Classify text role (`title`, `body`, `label`) before font and size normalization.
    - Use style-appropriate fonts only from the approved pool or explicit playful classroom fallbacks.
-   - Do not call a secondary OCR engine as a top-band OCR repair in the default flow. In representative tests it added rejected candidates but did not improve final text, geometry, or preview output.
+   - Do not call a secondary OCR engine as a top-band OCR repair in the default flow. In representative tests it added rejected candidates but did not improve final text, geometry, or PPTX output.
    - Missing section numerals should not be guessed. Add or repair section numbers only from reliable primary OCR evidence or a future dedicated numbering module.
    - When primary OCR splits a top heading into adjacent fragments, merge those fragments by x-order into one heading before typography and rebuild. Record this deterministic repair in `layout_repairs`.
    - When OCR splits a continuous paragraph into multiple visible rows inside the same visual region, column, card, bubble, or panel, rebuild it as one editable paragraph while preserving the original visible row breaks. Record `paragraphGroup`, `textSource=ocr_paragraph_group`, and `lineBreakSource=ocr_visible_rows`.
@@ -182,6 +185,7 @@ Practical execution order:
    - Editable replacement text requires old text to be removed from the background.
    - Default to local clean-text background for a fast first pass.
    - Use `model-clean` when local cleanup leaves visible blocks, damages illustrations, or cannot preserve textured backgrounds.
+   - In Codex chat, prefer `--model-provider codex-image` for complex pages. Treat the generated `codex_image_request` as a handoff for the Codex built-in image tool, then rerun the rebuild after saving the clean background to the expected output path.
    - For `model-clean`, prompt the model to edit the original image directly and remove only the OCR-listed text. Do not describe or reinterpret the scene.
    - For OpenAI-compatible image models, use an image-edit endpoint with `multipart/form-data`; do not use text-to-image generation endpoints for background repair because they can regenerate a different scene.
    - If a model-clean background changes composition, size, or text container positions, diagnose it as a background/OCR alignment issue before judging PPTX rendering.
@@ -198,9 +202,9 @@ Practical execution order:
    - Text-box height and line spacing must come from layout metrics, not a renderer-wide constant. The renderer executes `textBoxHeightScale` and `lineSpacing` without additional fitting.
    - The renderer must not silently replace fitted fonts. If a fitted font is unavailable, diagnose the font environment or rerun font fitting; do not hide substitution inside PPTX generation.
 
-8. **Preview QA**
-   - Export to preview images.
-   - Compare against the original page.
+8. **Output QA**
+   - Inspect the generated PPTX and diagnostic JSON.
+   - Compare the PPTX against the original page when an external viewer is available.
    - Attribute differences to OCR/parsing/fusion or renderer before changing anything.
 
 9. **Only then consider full-deck**
@@ -214,18 +218,18 @@ Before a new reconstruction run on a fresh machine or after major script changes
 python scripts/check_readiness.py
 ```
 
-This is a read-only check. It verifies local files, required Python modules, key binaries such as LibreOffice and Poppler, PaddleOCR runtime availability, and model-related environment variables. It does not install dependencies or call external model APIs.
+This is a read-only check. It verifies local files, required Python modules, core binaries such as Poppler, PaddleOCR runtime availability/startup, and model-related environment variables. Add `--ocr-smoke-image /path/to/page.png` when you need a real one-page PaddleOCR smoke test before a full run. It does not install dependencies or call external model APIs.
 
 ## Script Map
 
 Core scripts:
 
-- `scripts/check_readiness.py`: read-only local readiness and dependency check.
+- `scripts/check_readiness.py`: read-only local readiness and dependency check, including PaddleOCR startup and optional one-page OCR smoke.
 - `scripts/run_simple.py`: stable launcher for the simple flow.
-- `scripts/pdf_to_ppt_simple.py`: default PDF -> render -> PaddleOCR -> clean background -> python-pptx -> optional preview flow. Key post-processing rules live here: paragraph grouping, safe background cleanup, watermark stripping, typography grouping, conservative font fitting, and PPTX rebuild.
+- `scripts/pdf_to_ppt_simple.py`: default PDF -> render -> PaddleOCR -> clean background -> python-pptx flow. Key post-processing rules live here: paragraph grouping, safe background cleanup, watermark stripping, typography grouping, conservative font fitting, and PPTX rebuild.
 - `scripts/ocr_paddle_worker.py`: PaddleOCR batch worker called by the simple flow. Uses official `PP-OCRv6_small_det` and `PP-OCRv6_small_rec` by default, and sizes text from measured ink height through `style_probe`.
 - `scripts/style_probe.py`: shared polarity-agnostic style probe (`analyze_text_region`): foreground/background separation -> true text color, ink height, ink width, ink density. Single source for color/size recovery; used by both `ocr_paddle_worker.py` and `pdf_to_ppt_simple.py`.
-- `scripts/repair_background_with_image_model.py`: optional image-model background text removal for `--background model-clean`.
+- `scripts/repair_background_with_image_model.py`: optional image-model background text removal for `--background model-clean`; `codex-image` writes a Codex image-tool request package, while API backends call external image-edit endpoints.
 - `scripts/publish_check.py`: local pre-publish validation for README, metadata, required files, and script syntax.
 - `scripts/smoke_test.py`: local smoke test for script syntax and lightweight package checks.
 
@@ -265,10 +269,9 @@ Use the renderer that best supports the current experiment:
 
 - python-pptx: preferred default for the simple flow because it is easy to inspect and patch.
 - PPTXGenJS: preferred for fast deterministic generation from layout JSON.
-- LibreOffice: preferred for converting PPTX to PDF/PNG previews and round-trip validation.
 - PowerPoint/Keynote: final human visual validation when available.
 
-If a PPTX preview looks wrong, first inspect the layout JSON. Renderer changes cannot fix wrong text grouping, wrong title structure, wrong coordinates, or decorative OCR leakage.
+If a PPTX looks wrong, first inspect the layout JSON. Renderer changes cannot fix wrong text grouping, wrong title structure, wrong coordinates, or decorative OCR leakage.
 
 ## Boundaries
 
@@ -294,7 +297,6 @@ For every representative run, return clickable paths for:
 - work directory;
 - layout JSON;
 - PPTX;
-- preview images;
 - diagnostics or QA reports when produced.
 
 Keep the user-facing summary blunt: what improved, what got worse, and which layer owns the remaining problem.

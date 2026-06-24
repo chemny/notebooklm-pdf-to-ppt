@@ -171,12 +171,12 @@ General element decisions:
 
 ## Repair Pass
 
-After model output and before final preview, inspect representative pages for:
+After model output and PPTX rebuild, inspect representative pages for:
 
 - missing important text, labels, titles, captions, table cells, or diagram labels;
 - hallucinated or duplicated text;
 - broken reading order or grouping;
-- text clipped by PowerPoint/LibreOffice rendering;
+- text clipped by PowerPoint or another final presentation viewer;
 - text placed over important visual content;
 - old text remnants in the background;
 - residual-text QA failures in `background_text_qa.json`;
@@ -203,13 +203,13 @@ The repair pass should be based on the classified page type. For example, a data
 - Same visual list, glossary, table column, card, or repeated text group should use group-level style consistency. If sibling rows share column alignment, role, and comparable size, normalize their font weight from group evidence instead of letting each OCR row independently flip between bold and regular.
 - Font family selection must be a render-fit step, not a model guess. Candidate fonts must come from the approved pool and be scored against the original OCR region by rendered width and ink density. Record `fontFit`, `fontFamilySource`, previous font, selected font, score, width ratio, and size compensation in layout JSON.
 - For fitted groups, normalize sibling rows to the same selected font family and median fitted size. Do not let each row in a glossary/list independently pick a different font family.
-- Mixed Chinese/Latin glossary and list groups are high-risk for font substitution because CJK and Latin glyph metrics can diverge sharply. Preserve the approved CJK default font and group typography for these groups unless a candidate repeatedly improves preview quality across representative pages.
+- Mixed Chinese/Latin glossary and list groups are high-risk for font substitution because CJK and Latin glyph metrics can diverge sharply. Preserve the approved CJK default font and group typography for these groups unless a candidate repeatedly improves output quality across representative pages.
 - Font weight fitting may change weight for titles and high-confidence style groups, but ordinary body/dialogue text must not become bold solely because a bold candidate matches width better.
 - Same-level text should use consistent typography. Titles, card headings, body rows, captions, and labels should not randomly vary in size or alignment.
-- PowerPoint text boxes must be top-anchored, with explicit zero paragraph spacing and controlled line spacing. Do not rely on default PowerPoint/LibreOffice paragraph spacing, because it can make a correctly positioned text box render as if the text moved downward.
+- PowerPoint text boxes must be top-anchored, with explicit zero paragraph spacing and controlled line spacing. Do not rely on default presentation-app paragraph spacing, because it can make a correctly positioned text box render as if the text moved downward.
 - Text-box height and line spacing must be explicit layout fields, such as `textBoxHeightScale` and `lineSpacing`. Avoid renderer-wide height padding constants; they create excess blank space and hide real typography problems.
 - PPTX generation must not silently substitute fonts selected by the font-fit stage. If the selected font is unavailable, treat it as an environment/font-pool issue and fix upstream.
-- Calibrate source-pixel font size to PPT point size with a stable render scale and preview verification. If the coordinate is correct but the rendered size is wrong, fix the PPTX render mapping before changing OCR coordinates. Do not clamp trusted OCR font sizes to a fixed maximum point size during PPTX generation.
+- Calibrate source-pixel font size to PPT point size with a stable render scale and output verification. If the coordinate is correct but the rendered size is wrong, fix the PPTX render mapping before changing OCR coordinates. Do not clamp trusted OCR font sizes to a fixed maximum point size during PPTX generation.
 - Treat the OCR/visual layout JSON as the reconstruction contract. If a locked text box renders incorrectly, diagnose unit conversion, font substitution, or PowerPoint paragraph behavior first; do not mutate locked OCR coordinates or font sizes to compensate.
 - Infer bold only from reliable original-slide evidence: title role, explicit OCR/visual style evidence, or high-confidence style parsing. Do not infer bold from structure labels such as `Q:` / `A:` alone, and do not globally bold all large body text, because speech bubbles, captions, and list rows may become too heavy.
 - If a style decision is visually wrong, debug the style evidence layer first. Do not fix style errors by changing OCR coordinates, font sizes, or text box geometry.
@@ -235,7 +235,7 @@ A representative reconstruction is acceptable when:
 - no duplicated old text remains behind editable replacement text;
 - residual-text QA is clean, or the page is explicitly marked for image-model repair before final delivery;
 - element count remains manageable;
-- screenshot previews have been inspected.
+- the generated PPTX has been inspected.
 - when visual differences remain, the issue has been attributed to either OCR/parsing or rebuild rendering, with the next repair assigned to the responsible module.
 
 If any quality gate fails, fix the representative layout or choose a less aggressive reconstruction strategy before full-deck conversion.

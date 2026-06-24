@@ -106,13 +106,8 @@ Do not infer style from PaddleOCR alone. PaddleOCR does not provide full typogra
 Use python-pptx for the maintained default rebuild because it is easy to inspect
 and patch.
 
-Use LibreOffice for:
-
-- PPTX to PDF/PNG previews;
-- round-trip validation;
-- compatibility checks.
-
-Renderer changes are useful only after layout JSON passes QA.
+Use external presentation apps only for optional human validation after the
+PPTX is generated. Renderer changes are useful only after layout JSON passes QA.
 
 ## Stop Conditions
 
@@ -131,5 +126,5 @@ A change can be promoted into the default main flow only when:
 - it improves at least two visually different representative pages;
 - it does not regress the previous stable page set;
 - the improvement is explainable as a general rule, not a page-specific patch;
-- output paths include layout JSON, PPTX, previews, and diagnostics;
+- output paths include layout JSON, PPTX, and diagnostics;
 - the failure domain is documented if quality is still below target.

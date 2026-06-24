@@ -138,7 +138,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Repair slide background with an image model")
     parser.add_argument("--image", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--provider", choices=["gemini-native", "openai-image"], required=True)
+    parser.add_argument("--provider", choices=["codex-image", "gemini-native", "openai-image"], required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--base-url", default=os.environ.get("VISION_API_BASE_URL", "https://api.openai.com"))
     parser.add_argument("--api-key-env", default="VISION_API_KEY")
@@ -148,12 +148,26 @@ def main() -> int:
     parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for local debugging only")
     args = parser.parse_args()
 
-    api_key = os.environ.get(args.api_key_env)
-    if not api_key:
-        raise SystemExit(f"missing API key env: {args.api_key_env}")
     image = Path(args.image).expanduser().resolve()
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.provider == "codex-image":
+        request = {
+            "ok": False,
+            "provider": "codex-image",
+            "requires_codex_image_tool": True,
+            "image": str(image),
+            "expected_output": str(out_dir / f"{args.model}.clean_background.png"),
+            "prompt": args.prompt,
+        }
+        response_path = out_dir / f"{args.model}.codex_image_request.json"
+        response_path.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(request | {"response": str(response_path)}, ensure_ascii=False, indent=2))
+        return 2
+
+    api_key = os.environ.get(args.api_key_env)
+    if not api_key:
+        raise SystemExit(f"missing API key env: {args.api_key_env}")
 
     try:
         if args.provider == "gemini-native":

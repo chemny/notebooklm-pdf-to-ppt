@@ -120,7 +120,7 @@ Explicit line breaks in text elements are preserved. Use them when wrapping is s
 Current default model choices:
 
 - OCR: `PP-OCRv6_small_det` + `PP-OCRv6_small_rec`.
-- Background repair: `gpt-image-2` through an OpenAI-compatible image-edit endpoint when `--background model-clean` is used.
+- Background repair: in Codex chat, prefer the `codex-image` backend and use the built-in image tool on the original page image; for unattended CLI/API runs, use an explicit image-edit endpoint such as `openai-image` with `gpt-image-2-all`.
 
 Current practical reconstruction default:
 
